@@ -1,0 +1,18 @@
+[package]
+name = "miraivault"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+create-type = ["cdylib"]
+
+[dependencies]
+soroban-sdk = {version = "25.3.0", default-features = false }
+libm = "0.2"
+
+[dev-dependencies]
+soroban-sdk = { version = "25.3.0", default-features = false, features = ["testutils"] }
+
+
+[profile.release]
+overflow-checks = true
