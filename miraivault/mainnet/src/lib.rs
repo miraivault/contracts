@@ -318,6 +318,11 @@ impl TimeCapsule {
         vested >= schedule.num_years * schedule.frequency
     }
 
+    pub fn get_idle_amount(env: Env, vault_id: u64) -> i128 {
+        let schedule: VestingSchedule = Self::get_vault(env.clone(), vault_id);
+        schedule.idle_amount
+    }
+
     // Global stats (nice for dashboard)
     pub fn get_next_vault_id(env: Env) -> u64 {
         env.storage().persistent()
@@ -643,26 +648,45 @@ impl TimeCapsule {
             let deficit = amount_due - schedule.idle_amount;
             if schedule.p1_ratio != 0 && schedule.p2_ratio != 0 {
                 if schedule.last_withdraw_from == 0 {
-                    Self::withdraw_from_p2(env.clone(), vault_id, deficit); //call withdaw from p2
-                    schedule.last_withdraw_from = 1;
-                    p2_bal -= deficit;
+                    if p2_bal >= deficit {
+                        Self::withdraw_from_p2(env.clone(), vault_id, beneficiary.clone(), deficit); //call withdaw from p2
+                        schedule.last_withdraw_from = 1;
+                        p2_bal -= deficit;
+                    }
+                    else {
+                        Self::withdraw_from_p2(env.clone(), vault_id, beneficiary.clone(), p2_bal); //call max withdaw from p2
+                        schedule.last_withdraw_from = 1;
+                        Self::withdraw_from_p1(env.clone(), vault_id, beneficiary.clone(), deficit - p2_bal); //call remaining withdaw from p1
+                        p1_bal -= deficit - p2_bal;
+                        p2_bal = 0;
+                    }
+
                 }
                 else if schedule.last_withdraw_from == 1 {
-                    Self::withdraw_from_p1(env.clone(), vault_id, deficit); // call withdraw from p1
-                    schedule.last_withdraw_from = 0;
-                    p1_bal -= deficit;
+                    if p1_bal >= deficit {
+                        Self::withdraw_from_p1(env.clone(), vault_id, beneficiary.clone(), deficit); //call withdaw from p1
+                        schedule.last_withdraw_from = 0;
+                        p1_bal -= deficit;
+                    }
+                    else {
+                        Self::withdraw_from_p1(env.clone(), vault_id, beneficiary.clone(), p1_bal); //call max withdaw from p1
+                        schedule.last_withdraw_from = 0;
+                        Self::withdraw_from_p2(env.clone(), vault_id, beneficiary.clone(), deficit - p1_bal); //call remaining withdaw from p2
+                        p2_bal -= deficit - p1_bal;
+                        p1_bal = 0;
+                    }
                 }
                 else {
                     panic!("Insufficient token balance in your vault");
                 }
             }
             else if schedule.p1_ratio != 0 && schedule.p2_ratio == 0 {
-                Self::withdraw_from_p1(env.clone(), vault_id, deficit); // call withdraw from p1
+                Self::withdraw_from_p1(env.clone(), vault_id, beneficiary.clone(), deficit); // call withdraw from p1
                 schedule.last_withdraw_from = 0;
                 p1_bal -= deficit;
             }
             else if schedule.p1_ratio == 0 && schedule.p2_ratio != 0 {
-                Self::withdraw_from_p2(env.clone(), vault_id, deficit); // call withdraw from p1
+                Self::withdraw_from_p2(env.clone(), vault_id, beneficiary.clone(), deficit); // call withdraw from p1
                 schedule.last_withdraw_from = 0;
                 p2_bal -= deficit;
             }
@@ -674,11 +698,11 @@ impl TimeCapsule {
 
         if is_final_claim {
             // Withdraw all remaining from protocols
-            if schedule.supplied_p1 > 0 {
-                Self::withdraw_from_p1(env.clone(), vault_id, p1_bal);
+            if schedule.supplied_p1 > 0 && p1_bal != 0 {
+                Self::withdraw_from_p1(env.clone(), vault_id, beneficiary.clone(), p1_bal);
             }
-            if schedule.supplied_p2 > 0 {
-                Self::withdraw_from_p2(env.clone(), vault_id, p2_bal);
+            if schedule.supplied_p2 > 0 && p2_bal != 0 {
+                Self::withdraw_from_p2(env.clone(), vault_id, beneficiary.clone(), p2_bal);
             }
         }
 
@@ -804,10 +828,10 @@ impl TimeCapsule {
 
         // Withdraw all remaining from protocols
         if schedule.supplied_p1 > 0 {
-            Self::withdraw_from_p1(env.clone(), vault_id, schedule.supplied_p1);
+            Self::withdraw_from_p1(env.clone(), vault_id, sender.clone(), schedule.supplied_p1);
         }
         if schedule.supplied_p2 > 0 {
-            Self::withdraw_from_p2(env.clone(), vault_id, schedule.supplied_p2);
+            Self::withdraw_from_p2(env.clone(), vault_id, sender.clone(), schedule.supplied_p2);
         }
 
         // Return unvested main tokens
@@ -839,10 +863,11 @@ impl TimeCapsule {
         }.publish(&env);
     }
 
-    pub fn supply_to_p1(env: Env, vault_id: u64, amount: i128) {
+    pub fn supply_to_p1(env: Env, vault_id: u64, caller: Address, amount: i128) {
+        caller.require_auth();
         let mut schedule: VestingSchedule = Self::get_vault(env.clone(), vault_id);
         // Only sender can supply
-        if schedule.sender != env.invoker() { panic!("Only sender can supply"); }
+        if schedule.sender != caller { panic!("Only sender can supply"); }
         if schedule.is_cancelled { panic!("Vault cancelled"); }
         if schedule.p1_pool.is_none() { panic!("P1 not configured"); }
         if schedule.p1_ratio == 0 { panic!("P1 not authorized during vault creation") }
@@ -852,9 +877,10 @@ impl TimeCapsule {
         if amount > idle { panic!("Insufficient idle balance"); }
 
         let potential_amount_protocol = amount + schedule.supplied_p1;
-        if potential_amount_protocol > (50 * schedule.total_amount) / 100 { panic!("Cannot allocate more than 50% to one protocol") };
+        if potential_amount_protocol > ((50 as i128) * schedule.total_amount) / (100 as i128) { panic!("Cannot allocate more than 50% to one protocol") };
+        if potential_amount_protocol > ((schedule.p1_ratio as i128) * schedule.total_amount) / (100 as i128) { panic!("Cannot allocate more than the initially chosen protocol ratio") };
         let potential_amount_total = amount + schedule.supplied_p1 + schedule.supplied_p2;
-        if potential_amount_total > (70 * schedule.total_amount) / 100 { panic!("Cannot allocate more than 70% to all external protocols")};
+        if potential_amount_total > ((70 as i128) * schedule.total_amount) / (100 as i128) { panic!("Cannot allocate more than 70% to all external protocols")};
 
 
         Self::supply_to_p1_internal(&env, &schedule, amount);
@@ -866,10 +892,11 @@ impl TimeCapsule {
     }
 
 
-    pub fn supply_to_p2(env: Env, vault_id: u64, amount: i128) {
+    pub fn supply_to_p2(env: Env, vault_id: u64, caller: Address, amount: i128) {
+        caller.require_auth();
         let mut schedule: VestingSchedule = Self::get_vault(env.clone(), vault_id);
         // Only sender can supply
-        if schedule.sender != env.invoker() { panic!("Only sender can supply"); }
+        if schedule.sender != caller { panic!("Only sender can supply"); }
         if schedule.is_cancelled { panic!("Vault cancelled"); }
         if schedule.p2_pool.is_none() { panic!("P2 not configured"); }
         if schedule.p2_ratio == 0 { panic!("P2 not authorized during vault creation") }
@@ -879,9 +906,10 @@ impl TimeCapsule {
         if amount > idle { panic!("Insufficient idle balance"); }
 
         let potential_amount_protocol = amount + schedule.supplied_p2;
-        if potential_amount_protocol > (50 * schedule.total_amount) / 100 { panic!("Cannot allocate more than 50% to one protocol") };
+        if potential_amount_protocol > ((50 as i128) * schedule.total_amount) / (100 as i128) { panic!("Cannot allocate more than 50% to one protocol") };
+        if potential_amount_protocol > ((schedule.p2_ratio as i128) * schedule.total_amount) / (100 as i128) { panic!("Cannot allocate more than the initially chosen protocol ratio") };
         let potential_amount_total = amount + schedule.supplied_p1 + schedule.supplied_p2;
-        if potential_amount_total > (70 * schedule.total_amount) / 100 { panic!("Cannot allocate more than 70% to all external protocols")};
+        if potential_amount_total > ((70 as i128) * schedule.total_amount) / (100 as i128) { panic!("Cannot allocate more than 70% to all external protocols")};
 
         Self::supply_to_p2_internal(&env, &schedule, amount);
 
@@ -891,9 +919,10 @@ impl TimeCapsule {
         env.storage().persistent().set(&DataKey::Vault(vault_id), &schedule);
     }
 
-    pub fn withdraw_from_p1(env: Env, vault_id: u64, amount: i128) {
+    pub fn withdraw_from_p1(env: Env, vault_id: u64, caller: Address, amount: i128) {
+        caller.require_auth();
         let mut schedule: VestingSchedule = Self::get_vault(env.clone(), vault_id);
-        if schedule.sender != env.invoker() && schedule.beneficiary != env.invoker() {
+        if schedule.sender != caller && schedule.beneficiary != caller {
             panic!("Only sender or beneficiary can withdraw from protocol");
         }
         if schedule.is_cancelled { panic!("Vault cancelled"); }
@@ -909,9 +938,10 @@ impl TimeCapsule {
         env.storage().persistent().set(&DataKey::Vault(vault_id), &schedule);
     }
 
-    pub fn withdraw_from_p2(env: Env, vault_id: u64, amount: i128) {
+    pub fn withdraw_from_p2(env: Env, vault_id: u64, caller: Address, amount: i128) {
+        caller.require_auth();
         let mut schedule: VestingSchedule = Self::get_vault(env.clone(), vault_id);
-        if schedule.sender != env.invoker() && schedule.beneficiary != env.invoker() {
+        if schedule.sender != caller && schedule.beneficiary != caller {
             panic!("Only sender or beneficiary can withdraw from protocol");
         }
         if schedule.is_cancelled { panic!("Vault cancelled"); }
