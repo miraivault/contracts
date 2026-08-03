@@ -627,6 +627,7 @@ impl TimeCapsule {
 
         let vested = Self::get_vested_packets(&env, &schedule);
         let due = vested.saturating_sub(schedule.claimed_packets);
+
         if due == 0 {
             panic!("No main packets due yet");
         }
@@ -653,10 +654,24 @@ impl TimeCapsule {
 
         let mut p1_bal = schedule.supplied_p1;
         let mut p2_bal = schedule.supplied_p2;
+        let mut idle_amt = schedule.idle_amount;
 
+        if is_final_claim {
+            // Withdraw all remaining from protocols
+            if schedule.supplied_p1 > 0 && p1_bal != 0 {
+                Self::safe_withdraw_from_p1(env.clone(), vault_id, beneficiary.clone(), p1_bal);
+                p1_bal = 0;
+                idle_amt += p1_bal;
+            }
+            if schedule.supplied_p2 > 0 && p2_bal != 0 {
+                Self::safe_withdraw_from_p2(env.clone(), vault_id, beneficiary.clone(), p2_bal);
+                p2_bal = 0;
+                idle_amt += p2_bal;
+            }
+        }
 
-        if amount_due > schedule.idle_amount {
-            let deficit = amount_due - schedule.idle_amount;
+        if amount_due > idle_amt && !is_final_claim {
+            let deficit = amount_due - idle_amt;
            // panic!("DEBUG: Need to pull {} from protocols. p1_supplied={}, p2_supplied={}, p1_exists={}", deficit, schedule.supplied_p1, schedule.supplied_p2, schedule.p1_pool.is_some());
             if schedule.p1_ratio != 0 && schedule.p2_ratio != 0 && p1_bal != 0 && p2_bal != 0{
                 if schedule.last_withdraw_from == 0 {
@@ -713,15 +728,7 @@ impl TimeCapsule {
 
         }
 
-        if is_final_claim {
-            // Withdraw all remaining from protocols
-            if schedule.supplied_p1 > 0 && p1_bal != 0 {
-                Self::safe_withdraw_from_p1(env.clone(), vault_id, beneficiary.clone(), p1_bal);
-            }
-            if schedule.supplied_p2 > 0 && p2_bal != 0 {
-                Self::safe_withdraw_from_p2(env.clone(), vault_id, beneficiary.clone(), p2_bal);
-            }
-        }
+
 
         // Safety: ensure contract has enough
         let contract_balance = token_client.balance(&env.current_contract_address());
@@ -732,6 +739,9 @@ impl TimeCapsule {
         token_client.transfer(&env.current_contract_address(), &beneficiary, &amount_due);
 
         schedule.claimed_packets += due;
+        schedule.supplied_p1 = p1_bal;
+        schedule.supplied_p2 = p2_bal;
+        schedule.idle_amount = idle_amt - amount_due;
 
 
 
@@ -868,6 +878,9 @@ impl TimeCapsule {
         }
 
         schedule.is_cancelled = true;
+        schedule.supplied_p1 = 0;
+        schedule.supplied_p2 = 0;
+        schedule.idle_amount = 0;
 
 
 
@@ -899,8 +912,8 @@ impl TimeCapsule {
         let potential_amount_total = amount + schedule.supplied_p1 + schedule.supplied_p2;
         if potential_amount_total > ((70 as i128) * schedule.total_amount) / (100 as i128) { panic!("Cannot allocate more than 70% to all external protocols")};
 
-
-        Self::supply_to_p1_internal(&env, &schedule, &caller, amount);
+        let vault = env.current_contract_address();
+        Self::supply_to_p1_internal(&env, &schedule, &vault, amount);
 
         schedule.supplied_p1 += amount;
         schedule.idle_amount -= amount;
@@ -928,7 +941,8 @@ impl TimeCapsule {
         let potential_amount_total = amount + schedule.supplied_p1 + schedule.supplied_p2;
         if potential_amount_total > ((70 as i128) * schedule.total_amount) / (100 as i128) { panic!("Cannot allocate more than 70% to all external protocols")};
 
-        Self::supply_to_p2_internal(&env, &schedule, &caller, amount);
+        let vault = env.current_contract_address();
+        Self::supply_to_p2_internal(&env, &schedule, &vault, amount);
 
         schedule.supplied_p2 += amount;
         schedule.idle_amount -= amount;
