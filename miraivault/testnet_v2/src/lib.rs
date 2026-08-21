@@ -1,16 +1,25 @@
 #![no_std]
 use soroban_sdk::{contract, contractimpl, contractevent, contracttype, token, Address, Env, Vec};
 
+use crate::pool_client::{ PoolClient, Request, REQUEST_TYPE_SUPPLY_COLLATERAL, REQUEST_TYPE_WITHDRAW_COLLATERAL };
+
+use crate::defindex_client::{ DefindexClient };
+
+
 #[cfg(test)]
 use crate::mock_protocol::MockProtocolClient;
 
 mod mock_protocol;
+mod pool_client;
+mod defindex_client;
 
 const TESTNET_NATIVE_XLM: &str = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
 const MIN_VAULT_AMT: i128 = 1_000_000_000;
 const MAX_LARGENESS: i128 = 100_000_000_000;
 const MAX_TRUE_BALANCE_RATIO: i128 = 66;   // 66% of total MIRAI supply
-const PROTOCOL_FEE_BPS: u32 = 50;          // 0.5% protocol fee on yield rewards
+const PROTOCOL_FEE_BPS: u32 = 500;          // 5% protocol fee on yield rewards
+const REWARD_PRECISION: i128 = 1_000_000_000_000; // 1e12
+
 
 
 #[contract]
@@ -31,6 +40,16 @@ pub enum DataKey {
     AdjustmentFactor,
     CFactor,
     DFactor,
+    Treasury,
+    P1Token,
+    P2Token,
+    AccRewardPerShareP1,
+    TotalSuppliedP1,
+    LastRewardBalanceP1,
+    AccRewardPerShareP2,
+    TotalSuppliedP2,
+    LastRewardBalanceP2,
+
 }
 
 #[contracttype]
@@ -49,7 +68,7 @@ pub struct VestingSchedule {
     pub claimed_packets: u32,
     pub is_cancelled: bool,
 
-    // Yield protocols (p1 = Blend, p2 = Aquarius)
+    // Yield protocols (p1 = Blend, p2 = DeFindex)
     pub idle_amount: i128,
     pub p1_pool: Option<Address>,
     pub p2_pool: Option<Address>,
@@ -61,6 +80,10 @@ pub struct VestingSchedule {
 
     // Simple round-robin for forced withdrawals (0 = p1, 1 = p2)
     pub last_withdraw_from: u32,
+
+    // already credited rewards from secondary protocols
+    pub reward_debt_p1: i128,
+    pub reward_debt_p2: i128,
 }
 
 #[contracttype]
@@ -124,6 +147,22 @@ struct RewardClaimedEvent {
 }
 
 #[contractevent(data_format = "single-value")]
+struct ProtocolRewardClaimedEvent {
+    #[topic]
+    vault_id: u64,
+    #[topic]
+    claimant: Address,
+    #[topic]
+    protocol: u32,          // 1 = P1 (Blend), 2 = P2 (DeFindex)
+    #[topic]
+    total_claimed: i128,
+    #[topic]
+    user_share: i128,
+    #[topic]
+    fee: i128,
+}
+
+#[contractevent(data_format = "single-value")]
 struct VaultCancelledEvent {
     #[topic]
     vault_id: u64,
@@ -137,7 +176,7 @@ struct VaultCancelledEvent {
 #[contractimpl]
 impl TimeCapsule {
 
-    pub fn initialize(env: Env, mirai_token: Address, total_supply: i128, initial_true_balance: i128, only_stellar_token: bool){
+    pub fn initialize(env: Env, mirai_token: Address, total_supply: i128, initial_true_balance: i128, only_stellar_token: bool, p1_token: Address, p2_token: Address, treasury: Address){
         if env.storage().persistent().has(&DataKey::MiraiToken){
             panic!("Contract has already been initialized!");
         }
@@ -162,6 +201,9 @@ impl TimeCapsule {
         env.storage().persistent().set(&DataKey::TrueBalance, &initial_true_balance);
         env.storage().persistent().set(&DataKey::TotalSupply, &total_supply);
         env.storage().persistent().set(&DataKey::OnlyStellar, &only_stellar_token);
+        env.storage().persistent().set(&DataKey::P1Token, &p1_token);
+        env.storage().persistent().set(&DataKey::P2Token, &p2_token);
+        env.storage().persistent().set(&DataKey::Treasury, &treasury);
 
         let adj = (1920 as i128 * total_supply) / (10_000_000 as i128);
         env.storage().persistent().set(&DataKey::AdjustmentFactor, &adj);
@@ -237,6 +279,67 @@ impl TimeCapsule {
     fn get_d_factor(env: &Env) -> i128 {
         env.storage().persistent().get(&DataKey::DFactor).unwrap_or_else(|| panic!("Contract has not been initialized yet."))
     }
+
+    pub fn get_acc_reward_per_share_p1(env: &Env) -> i128 {
+    env.storage().persistent().get(&DataKey::AccRewardPerShareP1).unwrap_or(0)
+    }
+
+    fn set_acc_reward_per_share_p1(env: &Env, value: i128) {
+        env.storage().persistent().set(&DataKey::AccRewardPerShareP1, &value);
+    }
+
+    pub fn get_total_supplied_p1(env: &Env) -> i128 {
+        env.storage().persistent().get(&DataKey::TotalSuppliedP1).unwrap_or(0)
+    }
+
+    fn set_total_supplied_p1(env: &Env, value: i128) {
+        env.storage().persistent().set(&DataKey::TotalSuppliedP1, &value);
+    }
+
+    fn get_last_reward_balance_p1(env: &Env) -> i128 {
+        env.storage().persistent().get(&DataKey::LastRewardBalanceP1).unwrap_or(0)
+    }
+
+    fn set_last_reward_balance_p1(env: &Env, value: i128) {
+        env.storage().persistent().set(&DataKey::LastRewardBalanceP1, &value);
+    }
+
+    pub fn get_acc_reward_per_share_p2(env: &Env) -> i128 {
+    env.storage().persistent().get(&DataKey::AccRewardPerShareP2).unwrap_or(0)
+    }
+
+    fn set_acc_reward_per_share_p2(env: &Env, value: i128) {
+        env.storage().persistent().set(&DataKey::AccRewardPerShareP2, &value);
+    }
+
+    pub fn get_total_supplied_p2(env: &Env) -> i128 {
+        env.storage().persistent().get(&DataKey::TotalSuppliedP2).unwrap_or(0)
+    }
+
+    fn set_total_supplied_p2(env: &Env, value: i128) {
+        env.storage().persistent().set(&DataKey::TotalSuppliedP2, &value);
+    }
+
+    fn get_last_reward_balance_p2(env: &Env) -> i128 {
+        env.storage().persistent().get(&DataKey::LastRewardBalanceP2).unwrap_or(0)
+    }
+
+    fn set_last_reward_balance_p2(env: &Env, value: i128) {
+        env.storage().persistent().set(&DataKey::LastRewardBalanceP2, &value);
+    }
+
+    pub fn get_treasury_address(env: &Env) -> Address {
+        env.storage().persistent().get(&DataKey::Treasury).unwrap_or_else(|| panic!("Contract has not been initialized yet."))
+    }
+
+    fn get_p1_token_address(env: &Env) -> Address {
+        env.storage().persistent().get(&DataKey::P1Token).unwrap_or_else(|| panic!("Contract has not been initialized yet."))
+    }
+
+    fn get_p2_token_address(env: &Env) -> Address {
+        env.storage().persistent().get(&DataKey::P2Token).unwrap_or_else(|| panic!("Contract has not been initialized yet."))
+    }
+
 
     fn get_vested_packets(env: &Env, schedule: &VestingSchedule) -> u32 {
         if schedule.is_cancelled {
@@ -413,36 +516,126 @@ impl TimeCapsule {
     // Protocol helpers (p1 = Blend)
     fn supply_to_p1_internal(env: &Env, schedule: &VestingSchedule, caller: &Address, amount: i128) {
         if schedule.p1_ratio == 0 || schedule.p1_pool.is_none() || amount <= 0 { return; }
-        // Insert full Blend submit SupplyCollateral logic here when ready
         let pool = schedule.p1_pool.clone().unwrap();
-        let mock_client = mock_protocol::MockProtocolClient::new(env, &pool);  // only in test
+        // uncomment this block for cargo test, comment out for production
+
+        let mock_client = mock_protocol::MockProtocolClient::new(env, &pool);
         mock_client.supply(&schedule.vault_id, &caller, &amount);
+
+        // comment out this block for cargo test, uncomment for production
+        /*
+        let pool_addr = schedule.p1_pool.clone().unwrap();
+        let asset = schedule.token_address.clone();
+        let vault = env.current_contract_address();
+
+        let mut requests = Vec::new(env);
+        requests.push_back(Request {
+            request_type: REQUEST_TYPE_SUPPLY_COLLATERAL,
+            address: asset,
+            amount,
+        });
+
+        let client = PoolClient::new(env, &pool_addr);
+        client.submit(&vault, &vault, &vault, &requests);
+        */
     }
 
     fn withdraw_from_p1_internal(env: &Env, schedule: &VestingSchedule, amount: i128, to: &Address) {
         if schedule.p1_ratio == 0 || schedule.p1_pool.is_none() || amount <= 0 { return; }
-        // Insert full Blend withdraw logic here when ready
         let pool = schedule.p1_pool.clone().unwrap();
+        // uncomment this block for cargo test, comment out for production
+
         let mock_client = mock_protocol::MockProtocolClient::new(env, &pool);
         mock_client.withdraw(&schedule.vault_id, &amount, to);
+
+        // comment out this block for cargo test, uncomment for production
+        /*
+        let pool_addr = schedule.p1_pool.clone().unwrap();
+        let asset = schedule.token_address.clone();
+        let vault = env.current_contract_address();
+
+        let mut requests = Vec::new(env);
+        requests.push_back(Request {
+            request_type: REQUEST_TYPE_WITHDRAW_COLLATERAL,
+            address: asset,
+            amount,
+        });
+
+        let client = PoolClient::new(env, &pool_addr);
+        // Tokens will be sent to `to` (normally the vault itself)
+        client.submit(&vault, &vault, to, &requests);
+        */
     }
 
 
-    // Protocol helpers (p1 = Aquarius)
+    // Protocol helpers (p2 = DeFindex)
     fn supply_to_p2_internal(env: &Env, schedule: &VestingSchedule, caller: &Address, amount: i128) {
         if schedule.p2_ratio == 0 || schedule.p2_pool.is_none() || amount <= 0 { return; }
-        // Insert full Blend submit SupplyCollateral logic here when ready
+        let pool = schedule.p2_pool.clone().unwrap();
+        // uncomment this block for cargo test, comment out for production
+
+        let mock_client = mock_protocol::MockProtocolClient::new(env, &pool);
+        mock_client.supply(&schedule.vault_id, &caller, &amount);
+
+        // comment out this block for cargo test, uncomment for production
+        /*
+        let defindex_vault = schedule.p2_pool.clone().unwrap();
+        let vault_addr = env.current_contract_address();
+        let asset = schedule.token_address.clone();
+
+        // 1. Approve DeFindex to pull tokens from MiraiVault
+        let token_client = token::Client::new(env, &asset);
+        token_client.approve(
+            &vault_addr,
+            &defindex_vault,
+            &amount,
+            &(env.ledger().sequence() + 200), // reasonable expiration
+        );
+
+        // 2. Deposit
+        let client = DefindexClient::new(env, &defindex_vault);
+        client.deposit(&vault_addr, amount, 0); // min_shares = 0 for now
+        */
     }
 
     fn withdraw_from_p2_internal(env: &Env, schedule: &VestingSchedule, amount: i128, to: &Address) {
         if schedule.p2_ratio == 0 || schedule.p2_pool.is_none() || amount <= 0 { return; }
-        // Insert full Blend withdraw logic here when ready
+        let pool = schedule.p2_pool.clone().unwrap();
+        // uncomment this block for cargo test, comment out for production
+
+        let mock_client = mock_protocol::MockProtocolClient::new(env, &pool);
+        mock_client.withdraw(&schedule.vault_id, &amount, to);
+
+        // comment out this block for cargo test, uncomment for production
+        /*
+        let defindex_vault = schedule.p2_pool.clone().unwrap();
+        let vault_addr = env.current_contract_address();
+
+        let client = DefindexClient::new(env, &defindex_vault);
+
+        let total_shares = client.total_supply();
+        let managed_funds = client.fetch_total_managed_funds();
+
+        let total_xlm_managed = managed_funds.get(0).unwrap_or(0);
+        if total_xlm_managed == 0 {
+            return;
+        }
+
+        let shares_to_withdraw = (total_shares * amount) / total_xlm_managed;
+
+        let mut min_amounts_out = Vec::new(env);
+        min_amounts_out.push_back(0); // no slippage protection for now
+
+        client.withdraw(shares_to_withdraw, &min_amounts_out, &vault_addr);
+        */
     }
 
+    /*
     fn take_protocol_fee(amount: i128) -> (i128, i128) {
         let fee = (amount * PROTOCOL_FEE_BPS as i128) / 10_000;
         (amount - fee, fee)
     }
+    */
 
     // ================== CREATE FUND ==================
     pub fn create_fund(
@@ -481,7 +674,7 @@ impl TimeCapsule {
         }
 
         if p1_ratio != 0 && p1_pool.is_none() { panic!("Blend Pool required"); }
-        if p2_ratio != 0 && p2_pool.is_none() { panic!("Aquarius Pool required"); }
+        if p2_ratio != 0 && p2_pool.is_none() { panic!("DeFindex Pool required"); }
 
 
         let mut next_id: u64 = env.storage().persistent().get(&DataKey::NextVaultId).unwrap_or(0);
@@ -527,6 +720,8 @@ impl TimeCapsule {
             supplied_p1: 0,
             supplied_p2: 0,
             last_withdraw_from: lwf,
+            reward_debt_p1: 0,
+            reward_debt_p2: 0,
         };
 
         let total_reward = Self::calculate_reward(&env, total_amount, num_years);
@@ -915,7 +1110,36 @@ impl TimeCapsule {
         let vault = env.current_contract_address();
         Self::supply_to_p1_internal(&env, &schedule, &vault, amount);
 
+        let blnd = Self::get_p1_token_address(&env);
+        Self::update_p1_rewards(&env, &blnd);
+
+        let pending = Self::pending_p1_reward(&env, &schedule);
+
+        if pending > 0 {
+            let fee = (pending * PROTOCOL_FEE_BPS as i128) / 10_000;
+            let user_share = pending - fee;
+
+            let reward_client = token::Client::new(&env, &blnd);
+            let treasury = Self::get_treasury_address(&env);
+
+            reward_client.transfer(&env.current_contract_address(), &schedule.sender, &user_share);
+            if fee > 0 {
+                reward_client.transfer(&env.current_contract_address(), &treasury, &fee);
+            }
+
+            // Update last balance after transfer
+            let new_balance = reward_client.balance(&env.current_contract_address());
+            Self::set_last_reward_balance_p1(&env, new_balance);
+        }
+
         schedule.supplied_p1 += amount;
+        schedule.reward_debt_p1 = (schedule.supplied_p1 * Self::get_acc_reward_per_share_p1(&env)) / REWARD_PRECISION;
+
+        let mut total = Self::get_total_supplied_p1(&env);
+        total += amount;
+        Self::set_total_supplied_p1(&env, total);
+
+
         schedule.idle_amount -= amount;
 
         env.storage().persistent().set(&DataKey::Vault(vault_id), &schedule);
@@ -944,7 +1168,35 @@ impl TimeCapsule {
         let vault = env.current_contract_address();
         Self::supply_to_p2_internal(&env, &schedule, &vault, amount);
 
+        let dfdx = Self::get_p2_token_address(&env);
+        Self::update_p2_rewards(&env, &dfdx);
+
+        let pending = Self::pending_p2_reward(&env, &schedule);
+
+        if pending > 0 {
+            let fee = (pending * PROTOCOL_FEE_BPS as i128) / 10_000;
+            let user_share = pending - fee;
+
+            let reward_client = token::Client::new(&env, &dfdx);
+            let treasury = Self::get_treasury_address(&env);
+
+            reward_client.transfer(&env.current_contract_address(), &schedule.sender, &user_share);
+            if fee > 0 {
+                reward_client.transfer(&env.current_contract_address(), &treasury, &fee);
+            }
+
+            // Update last balance after transfer
+            let new_balance = reward_client.balance(&env.current_contract_address());
+            Self::set_last_reward_balance_p2(&env, new_balance);
+        }
+
         schedule.supplied_p2 += amount;
+        schedule.reward_debt_p2 = (schedule.supplied_p2 * Self::get_acc_reward_per_share_p2(&env)) / REWARD_PRECISION;
+
+        let mut total = Self::get_total_supplied_p2(&env);
+        total += amount;
+        Self::set_total_supplied_p2(&env, total);
+
         schedule.idle_amount -= amount;
 
         env.storage().persistent().set(&DataKey::Vault(vault_id), &schedule);
@@ -963,7 +1215,35 @@ impl TimeCapsule {
 
         Self::withdraw_from_p1_internal(&env, &schedule, amount, &env.current_contract_address());
 
+        let blnd = Self::get_p1_token_address(&env);
+        Self::update_p1_rewards(&env, &blnd);
+
+        let pending = Self::pending_p1_reward(&env, &schedule);
+
+        if pending > 0 {
+            let fee = (pending * PROTOCOL_FEE_BPS as i128) / 10_000;
+            let user_share = pending - fee;
+
+            let reward_client = token::Client::new(&env, &blnd);
+            let treasury = Self::get_treasury_address(&env);
+
+            reward_client.transfer(&env.current_contract_address(), &schedule.sender, &user_share);
+            if fee > 0 {
+                reward_client.transfer(&env.current_contract_address(), &treasury, &fee);
+            }
+
+            // Update last balance after transfer
+            let new_balance = reward_client.balance(&env.current_contract_address());
+            Self::set_last_reward_balance_p1(&env, new_balance);
+        }
+
         schedule.supplied_p1 -= amount;
+        schedule.reward_debt_p1 = (schedule.supplied_p1 * Self::get_acc_reward_per_share_p1(&env)) / REWARD_PRECISION;
+
+        let mut total = Self::get_total_supplied_p1(&env);
+        total -= amount;
+        Self::set_total_supplied_p1(&env, total);
+
         schedule.idle_amount += amount;
 
         env.storage().persistent().set(&DataKey::Vault(vault_id), &schedule);
@@ -982,7 +1262,35 @@ impl TimeCapsule {
 
         Self::withdraw_from_p2_internal(&env, &schedule, amount, &env.current_contract_address());
 
+        let dfdx = Self::get_p2_token_address(&env);
+        Self::update_p2_rewards(&env, &dfdx);
+
+        let pending = Self::pending_p2_reward(&env, &schedule);
+
+        if pending > 0 {
+            let fee = (pending * PROTOCOL_FEE_BPS as i128) / 10_000;
+            let user_share = pending - fee;
+
+            let reward_client = token::Client::new(&env, &dfdx);
+            let treasury = Self::get_treasury_address(&env);
+
+            reward_client.transfer(&env.current_contract_address(), &schedule.sender, &user_share);
+            if fee > 0 {
+                reward_client.transfer(&env.current_contract_address(), &treasury, &fee);
+            }
+
+            // Update last balance after transfer
+            let new_balance = reward_client.balance(&env.current_contract_address());
+            Self::set_last_reward_balance_p2(&env, new_balance);
+        }
+
         schedule.supplied_p2 -= amount;
+        schedule.reward_debt_p2 = (schedule.supplied_p2 * Self::get_acc_reward_per_share_p2(&env)) / REWARD_PRECISION;
+
+        let mut total = Self::get_total_supplied_p2(&env);
+        total -= amount;
+        Self::set_total_supplied_p2(&env, total);
+
         schedule.idle_amount += amount;
 
         env.storage().persistent().set(&DataKey::Vault(vault_id), &schedule);
@@ -1002,7 +1310,35 @@ impl TimeCapsule {
 
         Self::withdraw_from_p1_internal(&env, &schedule, amount, &env.current_contract_address());
 
+        let blnd = Self::get_p1_token_address(&env);
+        Self::update_p1_rewards(&env, &blnd);
+
+        let pending = Self::pending_p1_reward(&env, &schedule);
+
+        if pending > 0 {
+            let fee = (pending * PROTOCOL_FEE_BPS as i128) / 10_000;
+            let user_share = pending - fee;
+
+            let reward_client = token::Client::new(&env, &blnd);
+            let treasury = Self::get_treasury_address(&env);
+
+            reward_client.transfer(&env.current_contract_address(), &schedule.sender, &user_share);
+            if fee > 0 {
+                reward_client.transfer(&env.current_contract_address(), &treasury, &fee);
+            }
+
+            // Update last balance after transfer
+            let new_balance = reward_client.balance(&env.current_contract_address());
+            Self::set_last_reward_balance_p1(&env, new_balance);
+        }
+
         schedule.supplied_p1 -= amount;
+        schedule.reward_debt_p1 = (schedule.supplied_p1 * Self::get_acc_reward_per_share_p1(&env)) / REWARD_PRECISION;
+
+        let mut total = Self::get_total_supplied_p1(&env);
+        total -= amount;
+        Self::set_total_supplied_p1(&env, total);
+
         schedule.idle_amount += amount;
 
         env.storage().persistent().set(&DataKey::Vault(vault_id), &schedule);
@@ -1022,13 +1358,211 @@ impl TimeCapsule {
 
         Self::withdraw_from_p2_internal(&env, &schedule, amount, &env.current_contract_address());
 
+        let dfdx = Self::get_p2_token_address(&env);
+        Self::update_p2_rewards(&env, &dfdx);
+
+        let pending = Self::pending_p2_reward(&env, &schedule);
+
+        if pending > 0 {
+            let fee = (pending * PROTOCOL_FEE_BPS as i128) / 10_000;
+            let user_share = pending - fee;
+
+            let reward_client = token::Client::new(&env, &dfdx);
+            let treasury = Self::get_treasury_address(&env);
+
+            reward_client.transfer(&env.current_contract_address(), &schedule.sender, &user_share);
+            if fee > 0 {
+                reward_client.transfer(&env.current_contract_address(), &treasury, &fee);
+            }
+
+            // Update last balance after transfer
+            let new_balance = reward_client.balance(&env.current_contract_address());
+            Self::set_last_reward_balance_p2(&env, new_balance);
+        }
+
         schedule.supplied_p2 -= amount;
+        schedule.reward_debt_p2 = (schedule.supplied_p2 * Self::get_acc_reward_per_share_p2(&env)) / REWARD_PRECISION;
+
+        let mut total = Self::get_total_supplied_p2(&env);
+        total -= amount;
+        Self::set_total_supplied_p2(&env, total);
+
         schedule.idle_amount += amount;
 
         env.storage().persistent().set(&DataKey::Vault(vault_id), &schedule);
     }
 
 
+    // ================== TIER 2 YIELD REWARD FUNCTIONS ==================
+
+    fn update_p1_rewards(env: &Env, reward_token: &Address) {
+        let total_supplied = Self::get_total_supplied_p1(env);
+
+
+        let reward_client = token::Client::new(env, reward_token);
+        let current_balance = reward_client.balance(&env.current_contract_address());
+        let last_balance = Self::get_last_reward_balance_p1(env);
+
+        if current_balance <= last_balance {
+            return;
+        }
+
+        let new_rewards = current_balance - last_balance;
+
+        if total_supplied == 0 {
+            Self::set_last_reward_balance_p1(env, current_balance);
+            return;
+        }
+
+        let acc = Self::get_acc_reward_per_share_p1(env);
+        let new_acc = acc + (new_rewards * REWARD_PRECISION) / total_supplied;
+
+        Self::set_acc_reward_per_share_p1(env, new_acc);
+        Self::set_last_reward_balance_p1(env, current_balance);
+    }
+
+
+    fn update_p2_rewards(env: &Env, reward_token: &Address) {
+        let total_supplied = Self::get_total_supplied_p2(env);
+
+
+        let reward_client = token::Client::new(env, reward_token);
+        let current_balance = reward_client.balance(&env.current_contract_address());
+        let last_balance = Self::get_last_reward_balance_p2(env);
+
+        if current_balance <= last_balance {
+            return;
+        }
+
+        let new_rewards = current_balance - last_balance;
+
+        if total_supplied == 0 {
+            Self::set_last_reward_balance_p2(env, current_balance);
+            return;
+        }
+
+        let acc = Self::get_acc_reward_per_share_p2(env);
+        let new_acc = acc + (new_rewards * REWARD_PRECISION) / total_supplied;
+
+        Self::set_acc_reward_per_share_p2(env, new_acc);
+        Self::set_last_reward_balance_p2(env, current_balance);
+    }
+
+    fn pending_p1_reward(env: &Env, schedule: &VestingSchedule) -> i128 {
+        let acc = Self::get_acc_reward_per_share_p1(env);
+        let earned = (schedule.supplied_p1 * acc) / REWARD_PRECISION;
+        earned.saturating_sub(schedule.reward_debt_p1)
+    }
+
+    fn pending_p2_reward(env: &Env, schedule: &VestingSchedule) -> i128 {
+        let acc = Self::get_acc_reward_per_share_p2(env);
+        let earned = (schedule.supplied_p2 * acc) / REWARD_PRECISION;
+        earned.saturating_sub(schedule.reward_debt_p2)
+    }
+
+    pub fn claim_p1_rewards(env: Env, vault_id: u64, caller: Address) {
+        caller.require_auth();
+        let mut schedule = Self::get_vault(env.clone(), vault_id);
+
+        if schedule.sender != caller {
+            panic!("Only sender can claim protocol rewards");
+        }
+        if schedule.is_cancelled {
+            panic!("Vault cancelled");
+        }
+
+        // 1. Update global accumulator
+        let blnd_address = Self::get_p1_token_address(&env);
+        Self::update_p1_rewards(&env, &blnd_address);
+
+        // 2. Calculate pending
+        let pending = Self::pending_p1_reward(&env, &schedule);
+        if pending <= 0 {
+            panic!("No rewards to claim");
+        }
+
+        // 3. Fee split
+        let fee = (pending * PROTOCOL_FEE_BPS as i128) / 10000 as i128;          // 5% fee for MiraiVault to be able to afford food
+        let user_share = pending - fee;
+
+        let treasury: Address = env.storage().persistent().get(&DataKey::Treasury).unwrap();
+
+        // 4. Transfer
+        let reward_client = token::Client::new(&env, &blnd_address);
+        reward_client.transfer(&env.current_contract_address(), &schedule.sender, &user_share);
+        reward_client.transfer(&env.current_contract_address(), &treasury, &fee);
+
+        // 5. Update debt
+        schedule.reward_debt_p1 = (schedule.supplied_p1 * Self::get_acc_reward_per_share_p1(&env)) / REWARD_PRECISION;
+        env.storage().persistent().set(&DataKey::Vault(vault_id), &schedule);
+
+        // Also update last_reward_balance because we just transferred tokens out
+        let new_balance = reward_client.balance(&env.current_contract_address());
+        Self::set_last_reward_balance_p1(&env, new_balance);
+
+        ProtocolRewardClaimedEvent {
+            vault_id,
+            claimant: caller,
+            protocol: 1,
+            total_claimed: pending,
+            user_share,
+            fee,
+        }.publish(&env);
+    }
+
+    pub fn claim_p2_rewards(env: Env, vault_id: u64, caller: Address) {
+        caller.require_auth();
+        let mut schedule = Self::get_vault(env.clone(), vault_id);
+
+        if schedule.sender != caller {
+            panic!("Only sender can claim protocol rewards");
+        }
+        if schedule.is_cancelled {
+            panic!("Vault cancelled");
+        }
+
+        // 1. Update global accumulator
+        let dfdx_address = Self::get_p2_token_address(&env);
+        Self::update_p2_rewards(&env, &dfdx_address);
+
+        // 2. Calculate pending
+        let pending = Self::pending_p2_reward(&env, &schedule);
+        if pending <= 0 {
+            panic!("No rewards to claim");
+        }
+
+        // 3. Fee split
+        let fee = (pending * PROTOCOL_FEE_BPS as i128) / 10000 as i128;          // 5% fee for MiraiVault to be able to afford food
+        let user_share = pending - fee;
+
+        let treasury: Address = env.storage().persistent().get(&DataKey::Treasury).unwrap();
+
+        // 4. Transfer
+        let reward_client = token::Client::new(&env, &dfdx_address);
+        reward_client.transfer(&env.current_contract_address(), &schedule.sender, &user_share);
+        reward_client.transfer(&env.current_contract_address(), &treasury, &fee);
+
+        // 5. Update debt
+        schedule.reward_debt_p2 = (schedule.supplied_p2 * Self::get_acc_reward_per_share_p2(&env)) / REWARD_PRECISION;
+        env.storage().persistent().set(&DataKey::Vault(vault_id), &schedule);
+
+        // Also update last_reward_balance because we just transferred tokens out
+        let new_balance = reward_client.balance(&env.current_contract_address());
+        Self::set_last_reward_balance_p2(&env, new_balance);
+
+        ProtocolRewardClaimedEvent {
+            vault_id,
+            claimant: caller,
+            protocol: 2,
+            total_claimed: pending,
+            user_share,
+            fee,
+        }.publish(&env);
+    }
+
+
+
+    // ================== THE GOOD OL' BUMP ============================
 
     fn bump_vault_storage(env: &Env, vault_id: u64){
         let storage = env.storage().persistent();

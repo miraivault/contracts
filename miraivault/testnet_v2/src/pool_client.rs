@@ -50,3 +50,4 @@ impl<'a> PoolClient<'a> {
         );
     }
 }
+

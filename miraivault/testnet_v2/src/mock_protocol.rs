@@ -51,3 +51,4 @@ impl MockProtocol {
         token_client.transfer(&env.current_contract_address(), &to, &amount);
     }
 }
+
