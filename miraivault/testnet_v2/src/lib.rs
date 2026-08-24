@@ -518,12 +518,12 @@ impl TimeCapsule {
         if schedule.p1_ratio == 0 || schedule.p1_pool.is_none() || amount <= 0 { return; }
         let pool = schedule.p1_pool.clone().unwrap();
         // uncomment this block for cargo test, comment out for production
-
+        /*
         let mock_client = mock_protocol::MockProtocolClient::new(env, &pool);
         mock_client.supply(&schedule.vault_id, &caller, &amount);
-
+        */
         // comment out this block for cargo test, uncomment for production
-        /*
+
         let pool_addr = schedule.p1_pool.clone().unwrap();
         let asset = schedule.token_address.clone();
         let vault = env.current_contract_address();
@@ -537,19 +537,19 @@ impl TimeCapsule {
 
         let client = PoolClient::new(env, &pool_addr);
         client.submit(&vault, &vault, &vault, &requests);
-        */
+
     }
 
     fn withdraw_from_p1_internal(env: &Env, schedule: &VestingSchedule, amount: i128, to: &Address) {
         if schedule.p1_ratio == 0 || schedule.p1_pool.is_none() || amount <= 0 { return; }
         let pool = schedule.p1_pool.clone().unwrap();
         // uncomment this block for cargo test, comment out for production
-
+        /*
         let mock_client = mock_protocol::MockProtocolClient::new(env, &pool);
         mock_client.withdraw(&schedule.vault_id, &amount, to);
-
+        */
         // comment out this block for cargo test, uncomment for production
-        /*
+
         let pool_addr = schedule.p1_pool.clone().unwrap();
         let asset = schedule.token_address.clone();
         let vault = env.current_contract_address();
@@ -564,51 +564,67 @@ impl TimeCapsule {
         let client = PoolClient::new(env, &pool_addr);
         // Tokens will be sent to `to` (normally the vault itself)
         client.submit(&vault, &vault, to, &requests);
-        */
+
     }
 
 
     // Protocol helpers (p2 = DeFindex)
     fn supply_to_p2_internal(env: &Env, schedule: &VestingSchedule, caller: &Address, amount: i128) {
-        if schedule.p2_ratio == 0 || schedule.p2_pool.is_none() || amount <= 0 { return; }
-        let pool = schedule.p2_pool.clone().unwrap();
-        // uncomment this block for cargo test, comment out for production
+        if schedule.p2_ratio == 0 || schedule.p2_pool.is_none() || amount <= 0 {
+            return;
+        }
 
-        let mock_client = mock_protocol::MockProtocolClient::new(env, &pool);
-        mock_client.supply(&schedule.vault_id, &caller, &amount);
-
-        // comment out this block for cargo test, uncomment for production
-        /*
         let defindex_vault = schedule.p2_pool.clone().unwrap();
+        // uncomment this block for cargo test, comment out for production
+        /*
+        let mock_client = mock_protocol::MockProtocolClient::new(env, &defindex_vault);
+        mock_client.supply(&schedule.vault_id, &caller, &amount);
+        */
+        // comment out this block for cargo test, uncomment for production
+
         let vault_addr = env.current_contract_address();
+        let defindex_vault = schedule.p2_pool.clone().unwrap();
         let asset = schedule.token_address.clone();
 
-        // 1. Approve DeFindex to pull tokens from MiraiVault
+        // 1. Approve the DeFindex vault to pull tokens from us
         let token_client = token::Client::new(env, &asset);
         token_client.approve(
             &vault_addr,
             &defindex_vault,
             &amount,
-            &(env.ledger().sequence() + 200), // reasonable expiration
+            &(env.ledger().sequence() + 200),
         );
 
         // 2. Deposit
+        let mut amounts_desired = Vec::new(env);
+        amounts_desired.push_back(amount);
+
+        let mut amounts_min = Vec::new(env);
+        amounts_min.push_back(0); // or a small slippage tolerance
+
         let client = DefindexClient::new(env, &defindex_vault);
-        client.deposit(&vault_addr, amount, 0); // min_shares = 0 for now
-        */
+        client.deposit(&amounts_desired, &amounts_min, &vault_addr, &true); // invest = true
+
     }
 
+
+
+
     fn withdraw_from_p2_internal(env: &Env, schedule: &VestingSchedule, amount: i128, to: &Address) {
-        if schedule.p2_ratio == 0 || schedule.p2_pool.is_none() || amount <= 0 { return; }
-        let pool = schedule.p2_pool.clone().unwrap();
-        // uncomment this block for cargo test, comment out for production
+        if schedule.p2_ratio == 0 || schedule.p2_pool.is_none() || amount <= 0 {
+            return;
+        }
 
-        let mock_client = mock_protocol::MockProtocolClient::new(env, &pool);
-        mock_client.withdraw(&schedule.vault_id, &amount, to);
-
-        // comment out this block for cargo test, uncomment for production
-        /*
         let defindex_vault = schedule.p2_pool.clone().unwrap();
+
+        // uncomment this block for cargo test, comment out for production
+        /*
+        let mock_client = mock_protocol::MockProtocolClient::new(env, &defindex_vault);
+        mock_client.withdraw(&schedule.vault_id, &amount, to);
+        */
+
+        // comment this block out for cargo test, uncomment for production
+
         let vault_addr = env.current_contract_address();
 
         let client = DefindexClient::new(env, &defindex_vault);
@@ -616,19 +632,26 @@ impl TimeCapsule {
         let total_shares = client.total_supply();
         let managed_funds = client.fetch_total_managed_funds();
 
-        let total_xlm_managed = managed_funds.get(0).unwrap_or(0);
-        if total_xlm_managed == 0 {
+        let total_underlying = managed_funds.get(0).unwrap_or(0);
+
+        if total_underlying == 0 || total_shares == 0 {
             return;
         }
 
-        let shares_to_withdraw = (total_shares * amount) / total_xlm_managed;
+        let shares_to_withdraw  = (amount * total_shares) / total_underlying;
+
+        if shares_to_withdraw <= 0 {
+            return;
+        }
 
         let mut min_amounts_out = Vec::new(env);
-        min_amounts_out.push_back(0); // no slippage protection for now
+        min_amounts_out.push_back(0);
 
-        client.withdraw(shares_to_withdraw, &min_amounts_out, &vault_addr);
-        */
+
+        client.withdraw(shares_to_withdraw, &min_amounts_out, to);
+
     }
+
 
     /*
     fn take_protocol_fee(amount: i128) -> (i128, i128) {

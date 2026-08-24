@@ -13,24 +13,43 @@ impl DefindexClient {
         }
     }
 
-    pub fn deposit(&self, from: &Address, amount: i128, min_shares: i128) {
+    /// Correct deposit signature
+    pub fn deposit(
+        &self,
+        amounts_desired: &Vec<i128>,
+        amounts_min: &Vec<i128>,
+        from: &Address,
+        invest: &bool,
+    ) {
         self.env.invoke_contract::<()>(
             &self.address,
             &Symbol::new(&self.env, "deposit"),
-            (from.clone(), amount, min_shares).into_val(&self.env),
+            (
+                amounts_desired.clone(),
+                amounts_min.clone(),
+                from.clone(),
+                *invest,
+            )
+                .into_val(&self.env),
         );
     }
 
+    /// Withdraw by shares
     pub fn withdraw(
         &self,
-        shares: i128,
+        withdraw_shares: i128,
         min_amounts_out: &Vec<i128>,
         from: &Address,
     ) {
         self.env.invoke_contract::<()>(
             &self.address,
             &Symbol::new(&self.env, "withdraw"),
-            (shares, min_amounts_out.clone(), from.clone()).into_val(&self.env),
+            (
+                withdraw_shares,
+                min_amounts_out.clone(),
+                from.clone(),
+            )
+                .into_val(&self.env),
         );
     }
 
