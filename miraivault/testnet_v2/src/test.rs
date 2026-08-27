@@ -532,6 +532,293 @@ mod test {
         assert_eq!(final_schedule.idle_amount, 0);
     }
 
+
+    #[test]
+    fn test_claim_reward_sender_and_beneficiary() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let vault_contract_id = env.register(TimeCapsule, ());
+        let vault_client = TimeCapsuleClient::new(&env, &vault_contract_id);
+
+        // Reward tokens (P1/P2 not used in this test but required by initialize)
+        let p1_token_id = env.register(MockToken, ());
+        let p1_token_client = MockTokenClient::new(&env, &p1_token_id);
+        p1_token_client.initialize(&Address::generate(&env), &7, &String::from_str(&env, "BLND"), &String::from_str(&env, "BLND"));
+
+        let p2_token_id = env.register(MockToken, ());
+        let treasury = Address::generate(&env);
+
+        // MIRAI
+        let mirai_id = env.register(MockToken, ());
+        let mirai_client = MockTokenClient::new(&env, &mirai_id);
+        mirai_client.initialize(&Address::generate(&env), &7, &String::from_str(&env, "MIRAI"), &String::from_str(&env, "MIRAI"));
+        vault_client.initialize(&mirai_id, &10_000_000_i128, &5_000_000_i128, &false, &p1_token_id, &p2_token_id, &treasury);
+        mirai_client.mint(&vault_contract_id, &5_000_000_i128);
+
+        // Vesting token
+        let vesting_id = env.register(MockToken, ());
+        let vesting_client = MockTokenClient::new(&env, &vesting_id);
+        vesting_client.initialize(&Address::generate(&env), &7, &String::from_str(&env, "XLM"), &String::from_str(&env, "XLM"));
+
+        let sender = Address::generate(&env);
+        let beneficiary = Address::generate(&env);
+        let total = 10_000_000_000_i128;
+        vesting_client.mint(&sender, &total);
+
+        // Create vault (no protocols needed)
+        let vault_id = vault_client.create_fund(
+            &sender,
+            &beneficiary,
+            &vesting_id,
+            &total,
+            &5u32,   // 5 years
+            &4u32,   // quarterly → 20 packets
+            &50u32,  // 50/50 split
+            &None,
+            &0u32,
+            &None,
+            &0u32,
+        );
+
+        let reward_info = vault_client.get_reward(&vault_id);
+        let total_packets = 20i128;
+        let sender_per_packet = reward_info.sender_share / total_packets;
+        let receiver_per_packet = reward_info.receiver_share / total_packets;
+
+        // Advance time so 5 packets are vested
+        let schedule = vault_client.get_vault(&vault_id);
+        let seconds_per_year: u64 = 31_536_000;
+        let interval = (seconds_per_year * schedule.num_years as u64) / schedule.frequency as u64;
+        env.ledger().set_timestamp(schedule.start_timestamp + interval * 5 + 1);
+
+        // --- Sender claims ---
+        vault_client.claim_reward(&vault_id, &sender);
+        let expected_sender = sender_per_packet * 5;
+        assert_eq!(mirai_client.balance(&sender), expected_sender);
+
+        let updated_reward = vault_client.get_reward(&vault_id);
+        assert_eq!(updated_reward.claimed_sender, expected_sender);
+
+        // --- Beneficiary claims ---
+        vault_client.claim_reward(&vault_id, &beneficiary);
+        let expected_receiver = receiver_per_packet * 5;
+        assert_eq!(mirai_client.balance(&beneficiary), expected_receiver);
+
+        let final_reward = vault_client.get_reward(&vault_id);
+        assert_eq!(final_reward.claimed_receiver, expected_receiver);
+    }
+
+    #[test]
+    #[should_panic(expected = "No sender reward due yet")]
+    fn test_claim_reward_too_early_sender() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let vault_contract_id = env.register(TimeCapsule, ());
+        let vault_client = TimeCapsuleClient::new(&env, &vault_contract_id);
+
+        let p1_token_id = env.register(MockToken, ());
+        let p2_token_id = env.register(MockToken, ());
+        let treasury = Address::generate(&env);
+
+        let mirai_id = env.register(MockToken, ());
+        let mirai_client = MockTokenClient::new(&env, &mirai_id);
+        mirai_client.initialize(&Address::generate(&env), &7, &String::from_str(&env, "MIRAI"), &String::from_str(&env, "MIRAI"));
+        vault_client.initialize(&mirai_id, &10_000_000, &5_000_000, &false, &p1_token_id, &p2_token_id, &treasury);
+        mirai_client.mint(&vault_contract_id, &5_000_000);
+
+        let vesting_id = env.register(MockToken, ());
+        let vesting_client = MockTokenClient::new(&env, &vesting_id);
+        vesting_client.initialize(&Address::generate(&env), &7, &String::from_str(&env, "XLM"), &String::from_str(&env, "XLM"));
+
+        let sender = Address::generate(&env);
+        let beneficiary = Address::generate(&env);
+        vesting_client.mint(&sender, &10_000_000_000);
+
+        let vault_id = vault_client.create_fund(
+            &sender, &beneficiary, &vesting_id, &10_000_000_000,
+            &5, &4, &50,
+            &None, &0, &None, &0,
+        );
+
+        // Immediately try to claim → should panic
+        vault_client.claim_reward(&vault_id, &sender);
+    }
+
+    #[test]
+    #[should_panic(expected = "No receiver reward due yet")]
+    fn test_claim_reward_too_early_beneficiary() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let vault_contract_id = env.register(TimeCapsule, ());
+        let vault_client = TimeCapsuleClient::new(&env, &vault_contract_id);
+
+        let p1_token_id = env.register(MockToken, ());
+        let p2_token_id = env.register(MockToken, ());
+        let treasury = Address::generate(&env);
+
+        let mirai_id = env.register(MockToken, ());
+        let mirai_client = MockTokenClient::new(&env, &mirai_id);
+        mirai_client.initialize(&Address::generate(&env), &7, &String::from_str(&env, "MIRAI"), &String::from_str(&env, "MIRAI"));
+        vault_client.initialize(&mirai_id, &10_000_000, &5_000_000, &false, &p1_token_id, &p2_token_id, &treasury);
+        mirai_client.mint(&vault_contract_id, &5_000_000);
+
+        let vesting_id = env.register(MockToken, ());
+        let vesting_client = MockTokenClient::new(&env, &vesting_id);
+        vesting_client.initialize(&Address::generate(&env), &7, &String::from_str(&env, "XLM"), &String::from_str(&env, "XLM"));
+
+        let sender = Address::generate(&env);
+        let beneficiary = Address::generate(&env);
+        vesting_client.mint(&sender, &10_000_000_000);
+
+        let vault_id = vault_client.create_fund(
+            &sender, &beneficiary, &vesting_id, &10_000_000_000,
+            &5, &4, &50,
+            &None, &0, &None, &0,
+        );
+
+        vault_client.claim_reward(&vault_id, &beneficiary);
+    }
+
+    #[test]
+    #[should_panic(expected = "Unauthorized claimant")]
+    fn test_claim_reward_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let vault_contract_id = env.register(TimeCapsule, ());
+        let vault_client = TimeCapsuleClient::new(&env, &vault_contract_id);
+
+        let p1_token_id = env.register(MockToken, ());
+        let p2_token_id = env.register(MockToken, ());
+        let treasury = Address::generate(&env);
+
+        let mirai_id = env.register(MockToken, ());
+        let mirai_client = MockTokenClient::new(&env, &mirai_id);
+        mirai_client.initialize(&Address::generate(&env), &7, &String::from_str(&env, "MIRAI"), &String::from_str(&env, "MIRAI"));
+        vault_client.initialize(&mirai_id, &10_000_000, &5_000_000, &false, &p1_token_id, &p2_token_id, &treasury);
+        mirai_client.mint(&vault_contract_id, &5_000_000);
+
+        let vesting_id = env.register(MockToken, ());
+        let vesting_client = MockTokenClient::new(&env, &vesting_id);
+        vesting_client.initialize(&Address::generate(&env), &7, &String::from_str(&env, "XLM"), &String::from_str(&env, "XLM"));
+
+        let sender = Address::generate(&env);
+        let beneficiary = Address::generate(&env);
+        let random = Address::generate(&env);
+        vesting_client.mint(&sender, &10_000_000_000);
+
+        let vault_id = vault_client.create_fund(
+            &sender, &beneficiary, &vesting_id, &10_000_000_000,
+            &5, &4, &50,
+            &None, &0, &None, &0,
+        );
+
+        // Advance time so rewards exist
+        let schedule = vault_client.get_vault(&vault_id);
+        let interval = (31_536_000u64 * schedule.num_years as u64) / schedule.frequency as u64;
+        env.ledger().set_timestamp(schedule.start_timestamp + interval * 5 + 1);
+
+        vault_client.claim_reward(&vault_id, &random); // should panic
+    }
+
+    #[test]
+    #[should_panic(expected = "Vault is cancelled")]
+    fn test_claim_reward_after_cancel() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let vault_contract_id = env.register(TimeCapsule, ());
+        let vault_client = TimeCapsuleClient::new(&env, &vault_contract_id);
+
+        let p1_token_id = env.register(MockToken, ());
+        let p2_token_id = env.register(MockToken, ());
+        let treasury = Address::generate(&env);
+
+        let mirai_id = env.register(MockToken, ());
+        let mirai_client = MockTokenClient::new(&env, &mirai_id);
+        mirai_client.initialize(&Address::generate(&env), &7, &String::from_str(&env, "MIRAI"), &String::from_str(&env, "MIRAI"));
+        vault_client.initialize(&mirai_id, &10_000_000, &5_000_000, &false, &p1_token_id, &p2_token_id, &treasury);
+        mirai_client.mint(&vault_contract_id, &5_000_000);
+
+        let vesting_id = env.register(MockToken, ());
+        let vesting_client = MockTokenClient::new(&env, &vesting_id);
+        vesting_client.initialize(&Address::generate(&env), &7, &String::from_str(&env, "XLM"), &String::from_str(&env, "XLM"));
+
+        let sender = Address::generate(&env);
+        let beneficiary = Address::generate(&env);
+        vesting_client.mint(&sender, &10_000_000_000);
+
+        let vault_id = vault_client.create_fund(
+            &sender, &beneficiary, &vesting_id, &10_000_000_000,
+            &5, &4, &50,
+            &None, &0, &None, &0,
+        );
+
+        // Cancel immediately
+        vault_client.cancel_remaining(&vault_id, &sender);
+
+        // Trying to claim after cancel should panic
+        vault_client.claim_reward(&vault_id, &sender);
+    }
+
+
+    #[test]
+    fn test_claim_reward_final_remainder() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let vault_contract_id = env.register(TimeCapsule, ());
+        let vault_client = TimeCapsuleClient::new(&env, &vault_contract_id);
+
+        let p1_token_id = env.register(MockToken, ());
+        let p2_token_id = env.register(MockToken, ());
+        let treasury = Address::generate(&env);
+
+        let mirai_id = env.register(MockToken, ());
+        let mirai_client = MockTokenClient::new(&env, &mirai_id);
+        mirai_client.initialize(&Address::generate(&env), &7, &String::from_str(&env, "MIRAI"), &String::from_str(&env, "MIRAI"));
+        vault_client.initialize(&mirai_id, &10_000_000, &5_000_000, &false, &p1_token_id, &p2_token_id, &treasury);
+        mirai_client.mint(&vault_contract_id, &5_000_000);
+
+        let vesting_id = env.register(MockToken, ());
+        let vesting_client = MockTokenClient::new(&env, &vesting_id);
+        vesting_client.initialize(&Address::generate(&env), &7, &String::from_str(&env, "XLM"), &String::from_str(&env, "XLM"));
+
+        let sender = Address::generate(&env);
+        let beneficiary = Address::generate(&env);
+        let total = 10_000_000_000_i128;
+        vesting_client.mint(&sender, &total);
+
+        let vault_id = vault_client.create_fund(
+            &sender, &beneficiary, &vesting_id, &total,
+            &5, &4, &50,          // 50/50 split, 20 packets
+            &None, &0, &None, &0,
+        );
+
+        let reward_info = vault_client.get_reward(&vault_id);
+
+        // Jump all the way to the end
+        env.ledger().set_timestamp(100_000_000_000_000);
+
+        // Sender takes everything due (including any remainder)
+        vault_client.claim_reward(&vault_id, &sender);
+        assert_eq!(mirai_client.balance(&sender), reward_info.sender_share);
+
+        // Beneficiary takes everything due
+        vault_client.claim_reward(&vault_id, &beneficiary);
+        assert_eq!(mirai_client.balance(&beneficiary), reward_info.receiver_share);
+
+        // Nothing left
+        let final_reward = vault_client.get_reward(&vault_id);
+        assert_eq!(final_reward.claimed_sender, reward_info.sender_share);
+        assert_eq!(final_reward.claimed_receiver, reward_info.receiver_share);
+    }
+
+
+
     #[test]
     #[should_panic(expected = "Cannot allocate more than 50% to one protocol")]
     fn test_supply_exceeds_50_percent_limit() {
@@ -643,6 +930,176 @@ mod test {
 
         // Try another 40% to P2 → 80% total → should panic
         vault_client.supply_to_p2(&vault_id, &sender, &(total_amount * 40 / 100));
+    }
+
+    #[test]
+    #[should_panic(expected = "frequency must be 1, 2 or 4")]
+    fn test_improper_frequency() {
+        let env = Env::default();
+
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let vault_contract_id = env.register(TimeCapsule, ());
+        let vault_client = TimeCapsuleClient::new(&env, &vault_contract_id);
+
+        // Mock P1 and P2 token
+        let p1_token_id = env.register(MockToken, ());
+        let p1_token_client = MockTokenClient::new(&env, &p1_token_id);
+        p1_token_client.initialize(&Address::generate(&env), &7, &String::from_str(&env, "Blend"), &String::from_str(&env, "BLND"));
+
+        let p2_token_id = env.register(MockToken, ());
+        let p2_token_client = MockTokenClient::new(&env, &p2_token_id);
+        p2_token_client.initialize(&Address::generate(&env), &7, &String::from_str(&env, "DeFindex"), &String::from_str(&env, "DFDX"));
+
+
+        // Mock Treasury
+        let treasury = Address::generate(&env);
+
+        // MIRAI
+        let mirai_contract_id = env.register(MockToken, ());
+        let mirai_client = MockTokenClient::new(&env, &mirai_contract_id);
+        mirai_client.initialize(&Address::generate(&env), &7, &String::from_str(&env, "Mirai"), &String::from_str(&env, "MIRAI"));
+        vault_client.initialize(&mirai_contract_id, &10_000_000_i128, &5_000_000_i128, &false, &p1_token_id, &p2_token_id, &treasury);
+        mirai_client.mint(&vault_contract_id, &5_000_000_i128);
+
+        // Vesting token
+        let vesting_id = env.register(MockToken, ());
+        let vesting_client = MockTokenClient::new(&env, &vesting_id);
+        vesting_client.initialize(&Address::generate(&env), &7u32, &String::from_str(&env, "Test XLM"), &String::from_str(&env, "XLM"));
+
+        let sender = Address::generate(&env);
+        let beneficiary = Address::generate(&env);
+
+        let total_amount = 10_000_000_000_i128;
+        vesting_client.mint(&sender, &total_amount);
+
+        let initial_balance = vesting_client.balance(&sender);
+
+        let p1_addr = env.register(MockProtocol, ());
+        let p2_addr = env.register(MockProtocol, ());
+        // initialize both mocks...
+
+        let vault_id = vault_client.create_fund(
+            &sender, &beneficiary, &vesting_id, &total_amount,
+            &5u32, &3u32, &50u32,
+            &Some(p1_addr.clone()), &40u32,
+            &Some(p2_addr.clone()), &40u32,
+        );
+
+    }
+
+
+    #[test]
+    #[should_panic(expected = "num_years must be 4-30")]
+    fn test_too_long_period() {
+        let env = Env::default();
+
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let vault_contract_id = env.register(TimeCapsule, ());
+        let vault_client = TimeCapsuleClient::new(&env, &vault_contract_id);
+
+        // Mock P1 and P2 token
+        let p1_token_id = env.register(MockToken, ());
+        let p1_token_client = MockTokenClient::new(&env, &p1_token_id);
+        p1_token_client.initialize(&Address::generate(&env), &7, &String::from_str(&env, "Blend"), &String::from_str(&env, "BLND"));
+
+        let p2_token_id = env.register(MockToken, ());
+        let p2_token_client = MockTokenClient::new(&env, &p2_token_id);
+        p2_token_client.initialize(&Address::generate(&env), &7, &String::from_str(&env, "DeFindex"), &String::from_str(&env, "DFDX"));
+
+
+        // Mock Treasury
+        let treasury = Address::generate(&env);
+
+        // MIRAI
+        let mirai_contract_id = env.register(MockToken, ());
+        let mirai_client = MockTokenClient::new(&env, &mirai_contract_id);
+        mirai_client.initialize(&Address::generate(&env), &7, &String::from_str(&env, "Mirai"), &String::from_str(&env, "MIRAI"));
+        vault_client.initialize(&mirai_contract_id, &10_000_000_i128, &5_000_000_i128, &false, &p1_token_id, &p2_token_id, &treasury);
+        mirai_client.mint(&vault_contract_id, &5_000_000_i128);
+
+        // Vesting token
+        let vesting_id = env.register(MockToken, ());
+        let vesting_client = MockTokenClient::new(&env, &vesting_id);
+        vesting_client.initialize(&Address::generate(&env), &7u32, &String::from_str(&env, "Test XLM"), &String::from_str(&env, "XLM"));
+
+        let sender = Address::generate(&env);
+        let beneficiary = Address::generate(&env);
+
+        let total_amount = 10_000_000_000_i128;
+        vesting_client.mint(&sender, &total_amount);
+
+        let initial_balance = vesting_client.balance(&sender);
+
+        let p1_addr = env.register(MockProtocol, ());
+        let p2_addr = env.register(MockProtocol, ());
+        // initialize both mocks...
+
+        let vault_id = vault_client.create_fund(
+            &sender, &beneficiary, &vesting_id, &total_amount,
+            &50u32, &1u32, &50u32,
+            &Some(p1_addr.clone()), &40u32,
+            &Some(p2_addr.clone()), &40u32,
+        );
+
+    }
+
+
+    #[test]
+    #[should_panic(expected = "reward_split 0-100")]
+    fn test_invalid_split() {
+        let env = Env::default();
+
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let vault_contract_id = env.register(TimeCapsule, ());
+        let vault_client = TimeCapsuleClient::new(&env, &vault_contract_id);
+
+        // Mock P1 and P2 token
+        let p1_token_id = env.register(MockToken, ());
+        let p1_token_client = MockTokenClient::new(&env, &p1_token_id);
+        p1_token_client.initialize(&Address::generate(&env), &7, &String::from_str(&env, "Blend"), &String::from_str(&env, "BLND"));
+
+        let p2_token_id = env.register(MockToken, ());
+        let p2_token_client = MockTokenClient::new(&env, &p2_token_id);
+        p2_token_client.initialize(&Address::generate(&env), &7, &String::from_str(&env, "DeFindex"), &String::from_str(&env, "DFDX"));
+
+
+        // Mock Treasury
+        let treasury = Address::generate(&env);
+
+        // MIRAI
+        let mirai_contract_id = env.register(MockToken, ());
+        let mirai_client = MockTokenClient::new(&env, &mirai_contract_id);
+        mirai_client.initialize(&Address::generate(&env), &7, &String::from_str(&env, "Mirai"), &String::from_str(&env, "MIRAI"));
+        vault_client.initialize(&mirai_contract_id, &10_000_000_i128, &5_000_000_i128, &false, &p1_token_id, &p2_token_id, &treasury);
+        mirai_client.mint(&vault_contract_id, &5_000_000_i128);
+
+        // Vesting token
+        let vesting_id = env.register(MockToken, ());
+        let vesting_client = MockTokenClient::new(&env, &vesting_id);
+        vesting_client.initialize(&Address::generate(&env), &7u32, &String::from_str(&env, "Test XLM"), &String::from_str(&env, "XLM"));
+
+        let sender = Address::generate(&env);
+        let beneficiary = Address::generate(&env);
+
+        let total_amount = 10_000_000_000_i128;
+        vesting_client.mint(&sender, &total_amount);
+
+        let initial_balance = vesting_client.balance(&sender);
+
+        let p1_addr = env.register(MockProtocol, ());
+        let p2_addr = env.register(MockProtocol, ());
+        // initialize both mocks...
+
+        let vault_id = vault_client.create_fund(
+            &sender, &beneficiary, &vesting_id, &total_amount,
+            &10u32, &1u32, &150u32,
+            &Some(p1_addr.clone()), &40u32,
+            &Some(p2_addr.clone()), &40u32,
+        );
+
     }
 
 
