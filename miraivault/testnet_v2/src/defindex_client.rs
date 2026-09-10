@@ -13,7 +13,6 @@ impl DefindexClient {
         }
     }
 
-    /// Correct deposit signature
     pub fn deposit(
         &self,
         amounts_desired: &Vec<i128>,
@@ -34,7 +33,6 @@ impl DefindexClient {
         );
     }
 
-    /// Withdraw by shares
     pub fn withdraw(
         &self,
         withdraw_shares: i128,
@@ -68,5 +66,13 @@ impl DefindexClient {
             ().into_val(&self.env),
         )
     }
-}
 
+    /// NEW: balance of dfTokens (shares) owned by an address
+    pub fn balance(&self, owner: &Address) -> i128 {
+        self.env.invoke_contract(
+            &self.address,
+            &Symbol::new(&self.env, "balance"),
+            (owner.clone(),).into_val(&self.env),
+        )
+    }
+}
