@@ -1713,6 +1713,280 @@ mod test {
     }
 
 
+    #[test]
+    fn test_cancel_after_p2_yield() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let vault_contract_id = env.register(TimeCapsule, ());
+        let vault_client = TimeCapsuleClient::new(&env, &vault_contract_id);
+
+        let p1_token_id = env.register(MockToken, ());
+        let treasury = Address::generate(&env);
+
+        let mirai_id = env.register(MockToken, ());
+        let mirai_client = MockTokenClient::new(&env, &mirai_id);
+        mirai_client.initialize(&Address::generate(&env), &7, &String::from_str(&env, "MIRAI"), &String::from_str(&env, "MIRAI"));
+        vault_client.initialize(&mirai_id, &10_000_000, &5_000_000, &false, &p1_token_id, &treasury);
+        mirai_client.mint(&vault_contract_id, &5_000_000);
+
+        let vesting_id = env.register(MockToken, ());
+        let vesting_client = MockTokenClient::new(&env, &vesting_id);
+        vesting_client.initialize(&Address::generate(&env), &7, &String::from_str(&env, "XLM"), &String::from_str(&env, "XLM"));
+
+        let sender = Address::generate(&env);
+        let beneficiary = Address::generate(&env);
+        let total = 10_000_000_000_i128;
+        vesting_client.mint(&sender, &total);
+
+        let p2_addr = env.register(MockDefindex, ());
+        let p2_client = MockDefindexClient::new(&env, &p2_addr);
+        p2_client.initialize(&vesting_id);
+
+        // Give mock enough tokens to pay 10% yield
+        vesting_client.mint(&p2_addr, &2_000_000_000);
+
+        let vault_id = vault_client.create_fund(
+            &sender, &beneficiary, &vesting_id, &total,
+            &5, &4, &50,
+            &None, &0,
+            &Some(p2_addr), &40,
+        );
+
+        let supply = 4_000_000_000_i128; // 40%
+        vault_client.supply_to_p2(&vault_id, &sender, &supply);
+
+        let sender_before = vesting_client.balance(&sender);
+
+        // Cancel
+        vault_client.cancel_remaining(&vault_id, &sender);
+
+        let expected_yield = supply / 10;                 // 400_000_000
+        let expected_user_yield = expected_yield * 95 / 100;
+        let expected_fee = expected_yield - expected_user_yield;
+
+        let sender_after = vesting_client.balance(&sender);
+        let treasury_bal = vesting_client.balance(&treasury);
+
+        // Sender should get back full principal + 95% of yield
+        assert_eq!(sender_after, sender_before + total + expected_user_yield);
+        assert_eq!(treasury_bal, expected_fee);
+
+        let s = vault_client.get_vault(&vault_id);
+        assert!(s.is_cancelled);
+        assert_eq!(s.supplied_p2, 0);
+        assert_eq!(s.p2_shares, 0);
+        assert_eq!(s.p2_principal, 0);
+        assert_eq!(s.idle_amount, 0);
+    }
+
+    // ============================================================
+    // 2. Final claim with both P1 + P2
+    // ============================================================
+    #[test]
+    fn test_final_claim_both_protocols() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let vault_contract_id = env.register(TimeCapsule, ());
+        let vault_client = TimeCapsuleClient::new(&env, &vault_contract_id);
+
+        let p1_token_id = env.register(MockToken, ());
+        let treasury = Address::generate(&env);
+
+        let mirai_id = env.register(MockToken, ());
+        let mirai_client = MockTokenClient::new(&env, &mirai_id);
+        mirai_client.initialize(&Address::generate(&env), &7, &String::from_str(&env, "MIRAI"), &String::from_str(&env, "MIRAI"));
+        vault_client.initialize(&mirai_id, &10_000_000, &5_000_000, &false, &p1_token_id, &treasury);
+        mirai_client.mint(&vault_contract_id, &5_000_000);
+
+        let vesting_id = env.register(MockToken, ());
+        let vesting_client = MockTokenClient::new(&env, &vesting_id);
+        vesting_client.initialize(&Address::generate(&env), &7, &String::from_str(&env, "XLM"), &String::from_str(&env, "XLM"));
+
+        let sender = Address::generate(&env);
+        let beneficiary = Address::generate(&env);
+        let total = 10_000_000_000_i128;
+        vesting_client.mint(&sender, &total);
+
+        let p1_addr = env.register(MockProtocol, ());
+        let p2_addr = env.register(MockDefindex, ());
+        let p1_client = MockProtocolClient::new(&env, &p1_addr);
+        let p2_client = MockDefindexClient::new(&env, &p2_addr);
+        p1_client.initialize(&vesting_id);
+        p2_client.initialize(&vesting_id);
+
+        // Fund MockDefindex for yield
+        vesting_client.mint(&p2_addr, &1_000_000_000);
+
+        let vault_id = vault_client.create_fund(
+            &sender, &beneficiary, &vesting_id, &total,
+            &5, &4, &50,
+            &Some(p1_addr), &30,
+            &Some(p2_addr), &30,
+        );
+
+        let supply_p1 = 2_000_000_000_i128;
+        let supply_p2 = 2_000_000_000_i128;
+        vault_client.supply_to_p1(&vault_id, &sender, &supply_p1);
+        vault_client.supply_to_p2(&vault_id, &sender, &supply_p2);
+
+        // Jump to the end
+        env.ledger().set_timestamp(100_000_000_000_000);
+        vault_client.claim_main(&vault_id, &beneficiary);
+
+        let s = vault_client.get_vault(&vault_id);
+        assert_eq!(s.claimed_packets, 20);
+        assert_eq!(s.supplied_p1, 0);
+        assert_eq!(s.supplied_p2, 0);
+        assert_eq!(s.p2_shares, 0);
+        assert_eq!(s.p2_principal, 0);
+        assert_eq!(s.idle_amount, 0);
+
+        // Beneficiary got the full principal
+        assert_eq!(vesting_client.balance(&beneficiary), total);
+
+        // Sender got the P2 yield (95%)
+        let expected_yield = supply_p2 / 10;
+        let expected_user_yield = expected_yield * 95 / 100;
+        assert_eq!(vesting_client.balance(&sender), expected_user_yield);
+    }
+
+    // ============================================================
+    // 3. Non-final claim that forces a pull from P2 (deficit path)
+    // ============================================================
+    #[test]
+    fn test_deficit_pull_from_p2() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let vault_contract_id = env.register(TimeCapsule, ());
+        let vault_client = TimeCapsuleClient::new(&env, &vault_contract_id);
+
+        let p1_token_id = env.register(MockToken, ());
+        let treasury = Address::generate(&env);
+
+        let mirai_id = env.register(MockToken, ());
+        let mirai_client = MockTokenClient::new(&env, &mirai_id);
+        mirai_client.initialize(&Address::generate(&env), &7, &String::from_str(&env, "MIRAI"), &String::from_str(&env, "MIRAI"));
+        vault_client.initialize(&mirai_id, &10_000_000, &5_000_000, &false, &p1_token_id, &treasury);
+        mirai_client.mint(&vault_contract_id, &5_000_000);
+
+        let vesting_id = env.register(MockToken, ());
+        let vesting_client = MockTokenClient::new(&env, &vesting_id);
+        vesting_client.initialize(&Address::generate(&env), &7, &String::from_str(&env, "XLM"), &String::from_str(&env, "XLM"));
+
+        let sender = Address::generate(&env);
+        let beneficiary = Address::generate(&env);
+        let total = 10_000_000_000_i128;
+        vesting_client.mint(&sender, &total);
+
+        let p2_addr = env.register(MockDefindex, ());
+        let p2_client = MockDefindexClient::new(&env, &p2_addr);
+        p2_client.initialize(&vesting_id);
+        vesting_client.mint(&p2_addr, &2_000_000_000); // enough for yield
+
+        let vault_id = vault_client.create_fund(
+            &sender, &beneficiary, &vesting_id, &total,
+            &5, &4, &50,
+            &None, &0,
+            &Some(p2_addr), &50,          // allow up to 50%
+        );
+
+        // Supply 50% (maximum)
+        let supply = 5_000_000_000_i128;
+        vault_client.supply_to_p2(&vault_id, &sender, &supply);
+
+        // Now idle = 5B. We need a deficit, so let's make many packets due
+        // so that amount_due > idle.
+        let schedule = vault_client.get_vault(&vault_id);
+        let interval = (31_536_000u64 * schedule.num_years as u64) / schedule.frequency as u64;
+
+        // Advance enough time for 12 packets (12 * 500M = 6B > 5B idle)
+        env.ledger().set_timestamp(schedule.start_timestamp + interval * 12 + 1);
+
+        let sender_before = vesting_client.balance(&sender);
+
+        vault_client.claim_main(&vault_id, &beneficiary);
+
+        let sender_after = vesting_client.balance(&sender);
+
+        // Now a pull from P2 must have happened → sender should have received yield
+        assert!(
+            sender_after > sender_before,
+            "Sender should have received yield from the forced P2 withdrawal"
+        );
+
+        // Optional stronger check
+        let s = vault_client.get_vault(&vault_id);
+        assert!(s.supplied_p2 < supply, "Some funds should have been pulled from P2");
+    }
+
+
+    // ============================================================
+    // 4. Double supply then full withdraw (share math)
+    // ============================================================
+    #[test]
+    fn test_p2_double_supply_then_full_withdraw() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let vault_contract_id = env.register(TimeCapsule, ());
+        let vault_client = TimeCapsuleClient::new(&env, &vault_contract_id);
+
+        let p1_token_id = env.register(MockToken, ());
+        let treasury = Address::generate(&env);
+
+        let mirai_id = env.register(MockToken, ());
+        let mirai_client = MockTokenClient::new(&env, &mirai_id);
+        mirai_client.initialize(&Address::generate(&env), &7, &String::from_str(&env, "MIRAI"), &String::from_str(&env, "MIRAI"));
+        vault_client.initialize(&mirai_id, &10_000_000, &5_000_000, &false, &p1_token_id, &treasury);
+        mirai_client.mint(&vault_contract_id, &5_000_000);
+
+        let vesting_id = env.register(MockToken, ());
+        let vesting_client = MockTokenClient::new(&env, &vesting_id);
+        vesting_client.initialize(&Address::generate(&env), &7, &String::from_str(&env, "XLM"), &String::from_str(&env, "XLM"));
+
+        let sender = Address::generate(&env);
+        let beneficiary = Address::generate(&env);
+        let total = 10_000_000_000_i128;
+        vesting_client.mint(&sender, &total);
+
+        let p2_addr = env.register(MockDefindex, ());
+        let p2_client = MockDefindexClient::new(&env, &p2_addr);
+        p2_client.initialize(&vesting_id);
+        vesting_client.mint(&p2_addr, &2_000_000_000);
+
+        let vault_id = vault_client.create_fund(
+            &sender, &beneficiary, &vesting_id, &total,
+            &5, &4, &50,
+            &None, &0,
+            &Some(p2_addr), &50,
+        );
+
+        let amount1 = 2_000_000_000_i128;
+        let amount2 = 3_000_000_000_i128;
+
+        vault_client.supply_to_p2(&vault_id, &sender, &amount1);
+        vault_client.supply_to_p2(&vault_id, &sender, &amount2);
+
+        let s = vault_client.get_vault(&vault_id);
+        assert_eq!(s.supplied_p2, amount1 + amount2);
+        assert_eq!(s.p2_shares, amount1 + amount2);
+        assert_eq!(s.p2_principal, amount1 + amount2);
+
+        // Full withdraw
+        vault_client.withdraw_from_p2(&vault_id, &sender, &(amount1 + amount2));
+
+        let s2 = vault_client.get_vault(&vault_id);
+        assert_eq!(s2.supplied_p2, 0);
+        assert_eq!(s2.p2_shares, 0);
+        assert_eq!(s2.p2_principal, 0);
+        assert_eq!(s2.idle_amount, total);
+    }
+
+
 
 
 }
+

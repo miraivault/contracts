@@ -895,10 +895,8 @@ impl TimeCapsule {
 
         let token_client = token::Client::new(&env, &schedule.token_address);
 
-        // Calculate base amount due
         let mut amount_due = schedule.packet_amount * (due as i128);
 
-        // If this claim completes the vesting, add any remainder to the beneficiary
         if is_final_claim {
             let total_released_so_far = schedule.packet_amount * (schedule.claimed_packets as i128);
             let total_should_be_released = schedule.total_amount; // exact original amount
@@ -910,103 +908,71 @@ impl TimeCapsule {
             panic!("Nothing to claim");
         }
 
-        let mut p1_bal = schedule.supplied_p1;
-        let mut p2_bal = schedule.supplied_p2;
-        let mut idle_amt = schedule.idle_amount;
+        let mut schedule = Self::get_vault(env.clone(), vault_id);
 
         if is_final_claim {
-            // Withdraw all remaining from protocols
-            if schedule.supplied_p1 > 0 && p1_bal != 0 {
-                Self::safe_withdraw_from_p1(env.clone(), vault_id, beneficiary.clone(), p1_bal);
-                //p1_bal = 0;
-                //idle_amt += p1_bal;
+            if schedule.supplied_p1 > 0 {
+                Self::safe_withdraw_from_p1(env.clone(), vault_id, beneficiary.clone(), schedule.supplied_p1);
             }
-            if schedule.supplied_p2 > 0 && p2_bal != 0 {
-                Self::safe_withdraw_from_p2(env.clone(), vault_id, beneficiary.clone(), p2_bal);
-                //p2_bal = 0;
-                //idle_amt += p2_bal;
+            if schedule.supplied_p2 > 0 {
+                Self::safe_withdraw_from_p2(env.clone(), vault_id, beneficiary.clone(), schedule.supplied_p2);
             }
+            // Re-fetch after pulls
+            schedule = Self::get_vault(env.clone(), vault_id);
         }
 
-        schedule = Self::get_vault(env.clone(), vault_id);
-        p1_bal = schedule.supplied_p1;
-        p2_bal = schedule.supplied_p2;
-        idle_amt = schedule.idle_amount;
+        if !is_final_claim && amount_due > schedule.idle_amount {
+            let deficit = amount_due - schedule.idle_amount;
 
-        if amount_due > idle_amt && !is_final_claim {
-            let deficit = amount_due - idle_amt;
-           // panic!("DEBUG: Need to pull {} from protocols. p1_supplied={}, p2_supplied={}, p1_exists={}", deficit, schedule.supplied_p1, schedule.supplied_p2, schedule.p1_pool.is_some());
-            if schedule.p1_ratio != 0 && schedule.p2_ratio != 0 && p1_bal != 0 && p2_bal != 0{
+
+
+            if schedule.p1_ratio != 0 && schedule.p2_ratio != 0
+                && schedule.supplied_p1 > 0 && schedule.supplied_p2 > 0
+            {
                 if schedule.last_withdraw_from == 0 {
-                    if p2_bal >= deficit {
-                        Self::safe_withdraw_from_p2(env.clone(), vault_id, beneficiary.clone(), deficit); //call withdaw from p2
+                    if schedule.supplied_p2 >= deficit {
+                        Self::safe_withdraw_from_p2(env.clone(), vault_id, beneficiary.clone(), deficit);
                         schedule.last_withdraw_from = 1;
-                        p2_bal -= deficit;
-                    }
-                    else {
-                        //panic!("WE ARE HERE deficit={}, p2_bal={}", deficit, p2_bal);
-                        Self::safe_withdraw_from_p2(env.clone(), vault_id, beneficiary.clone(), p2_bal); //call max withdaw from p2
+                    } else {
+                        let p2_amount = schedule.supplied_p2;
+                        Self::safe_withdraw_from_p2(env.clone(), vault_id, beneficiary.clone(), p2_amount);
+                        Self::safe_withdraw_from_p1(env.clone(), vault_id, beneficiary.clone(), deficit - p2_amount);
                         schedule.last_withdraw_from = 1;
-                        Self::safe_withdraw_from_p1(env.clone(), vault_id, beneficiary.clone(), deficit - p2_bal); //call remaining withdaw from p1
-                        p1_bal -= deficit - p2_bal;
-                        p2_bal = 0;
                     }
-
-                }
-                else if schedule.last_withdraw_from == 1 {
-                    if p1_bal >= deficit {
-                        //panic!("WE ARE HERE 2");
-                        Self::safe_withdraw_from_p1(env.clone(), vault_id, beneficiary.clone(), deficit); //call withdaw from p1
+                } else {
+                    if schedule.supplied_p1 >= deficit {
+                        Self::safe_withdraw_from_p1(env.clone(), vault_id, beneficiary.clone(), deficit);
                         schedule.last_withdraw_from = 0;
-                        p1_bal -= deficit;
-                    }
-                    else {
-                        //panic!("WE ARE HERE 3");
-                        Self::safe_withdraw_from_p1(env.clone(), vault_id, beneficiary.clone(), p1_bal); //call max withdaw from p1
+                    } else {
+                        let p1_amount = schedule.supplied_p1;
+                        Self::safe_withdraw_from_p1(env.clone(), vault_id, beneficiary.clone(), p1_amount);
+                        Self::safe_withdraw_from_p2(env.clone(), vault_id, beneficiary.clone(), deficit - p1_amount);
                         schedule.last_withdraw_from = 0;
-                        Self::safe_withdraw_from_p2(env.clone(), vault_id, beneficiary.clone(), deficit - p1_bal); //call remaining withdaw from p2
-                        p2_bal -= deficit - p1_bal;
-                        p1_bal = 0;
                     }
                 }
-                else {
-                    panic!("Insufficient token balance in your vault");
-                }
-            }
-            else if (schedule.p1_ratio != 0 && p1_bal !=0) && (schedule.p2_ratio == 0 || p2_bal == 0){
-                //panic!("WE ARE HERE 5");
-                Self::safe_withdraw_from_p1(env.clone(), vault_id, beneficiary.clone(), deficit); // call withdraw from p1
+            } else if schedule.supplied_p1 > 0 {
+                Self::safe_withdraw_from_p1(env.clone(), vault_id, beneficiary.clone(), deficit);
                 schedule.last_withdraw_from = 0;
-                p1_bal -= deficit;
-            }
-            else if (schedule.p1_ratio == 0 || p1_bal == 0) && (schedule.p2_ratio != 0 && p2_bal != 0) {
-                //panic!("WE ARE HERE 6");
-                Self::safe_withdraw_from_p2(env.clone(), vault_id, beneficiary.clone(), deficit); // call withdraw from p1
-                schedule.last_withdraw_from = 0;
-                p2_bal -= deficit;
-            }
-            else {
+            } else if schedule.supplied_p2 > 0 {
+                Self::safe_withdraw_from_p2(env.clone(), vault_id, beneficiary.clone(), deficit);
+                schedule.last_withdraw_from = 1;
+            } else {
                 panic!("Insufficient token balance in your vault");
             }
 
+            schedule = Self::get_vault(env.clone(), vault_id);
         }
 
-
-
-        // Safety: ensure contract has enough
-        let contract_balance = token_client.balance(&env.current_contract_address());
-        if contract_balance < amount_due {
+        // Now we can trust schedule.idle_amount
+        if schedule.idle_amount < amount_due {
             panic!("Insufficient token balance in contract");
         }
 
+        let token_client = token::Client::new(&env, &schedule.token_address);
         token_client.transfer(&env.current_contract_address(), &beneficiary, &amount_due);
 
         schedule.claimed_packets += due;
-        schedule.supplied_p1 = p1_bal;
-        schedule.supplied_p2 = p2_bal;
-        schedule.idle_amount = idle_amt - amount_due;
-
-
+        schedule.idle_amount -= amount_due;
 
         env.storage().persistent().set(&DataKey::Vault(vault_id), &schedule);
 
@@ -1015,7 +981,8 @@ impl TimeCapsule {
             beneficiary,
             amount: amount_due,
             packets: due,
-        }.publish(&env);
+        }
+        .publish(&env);
     }
 
     // ================== CLAIM REWARD (sender or beneficiary) ==================
@@ -1111,12 +1078,7 @@ impl TimeCapsule {
             panic!("Already cancelled");
         }
 
-        let vested = Self::get_vested_packets(&env, &schedule);
-        let total_packets = schedule.num_years * schedule.frequency;
-        let unvested_packets = total_packets - vested;
-        let unvested_main = schedule.packet_amount * (unvested_packets as i128);
-
-        // Withdraw all remaining from protocols
+        // 1. Pull everything back from protocols
         if schedule.supplied_p1 > 0 {
             Self::safe_withdraw_from_p1(env.clone(), vault_id, sender.clone(), schedule.supplied_p1);
         }
@@ -1124,15 +1086,21 @@ impl TimeCapsule {
             Self::safe_withdraw_from_p2(env.clone(), vault_id, sender.clone(), schedule.supplied_p2);
         }
 
-        // Return unvested main tokens
-        if unvested_main > 0 {
+        // 2. Re-fetch after the safe withdraws (critical)
+        schedule = Self::get_vault(env.clone(), vault_id);
+
+        // 3. Everything that is now idle belongs to the sender
+        let amount_to_return = schedule.idle_amount;
+
+        if amount_to_return > 0 {
             let token_client = token::Client::new(&env, &schedule.token_address);
-            token_client.transfer(&env.current_contract_address(), &sender, &unvested_main);
+            token_client.transfer(&env.current_contract_address(), &sender, &amount_to_return);
         }
 
+        // 4. Return any unclaimed MIRAI reward to true_balance
         let reward_info: RewardInfo = Self::get_reward(env.clone(), vault_id);
-        let remaining_reward = (reward_info.sender_share - reward_info.claimed_sender) +
-                               (reward_info.receiver_share - reward_info.claimed_receiver);
+        let remaining_reward = (reward_info.sender_share - reward_info.claimed_sender)
+            + (reward_info.receiver_share - reward_info.claimed_receiver);
 
         if remaining_reward > 0 {
             let mut tb = Self::get_true_balance(&env);
@@ -1140,12 +1108,13 @@ impl TimeCapsule {
             Self::set_true_balance(&env, tb);
         }
 
+        // 5. Mark as cancelled and zero everything
         schedule.is_cancelled = true;
         schedule.supplied_p1 = 0;
         schedule.supplied_p2 = 0;
+        schedule.p2_shares = 0;
+        schedule.p2_principal = 0;
         schedule.idle_amount = 0;
-
-
 
         env.storage().persistent().set(&DataKey::Vault(vault_id), &schedule);
 
@@ -1153,8 +1122,10 @@ impl TimeCapsule {
             vault_id,
             sender,
             beneficiary: schedule.beneficiary,
-        }.publish(&env);
+        }
+        .publish(&env);
     }
+
 
     pub fn supply_to_p1(env: Env, vault_id: u64, caller: Address, amount: i128) {
         caller.require_auth();
@@ -1503,31 +1474,6 @@ impl TimeCapsule {
     }
 
 
-    fn update_p2_rewards(env: &Env, reward_token: &Address) {
-        let total_supplied = Self::get_total_supplied_p2(env);
-
-
-        let reward_client = token::Client::new(env, reward_token);
-        let current_balance = reward_client.balance(&env.current_contract_address());
-        let last_balance = Self::get_last_reward_balance_p2(env);
-
-        if current_balance <= last_balance {
-            return;
-        }
-
-        let new_rewards = current_balance - last_balance;
-
-        if total_supplied == 0 {
-            Self::set_last_reward_balance_p2(env, current_balance);
-            return;
-        }
-
-        let acc = Self::get_acc_reward_per_share_p2(env);
-        let new_acc = acc + (new_rewards * REWARD_PRECISION) / total_supplied;
-
-        Self::set_acc_reward_per_share_p2(env, new_acc);
-        Self::set_last_reward_balance_p2(env, current_balance);
-    }
 
     fn pending_p1_reward(env: &Env, schedule: &VestingSchedule) -> i128 {
         let acc = Self::get_acc_reward_per_share_p1(env);
@@ -1535,11 +1481,7 @@ impl TimeCapsule {
         earned.saturating_sub(schedule.reward_debt_p1)
     }
 
-    fn pending_p2_reward(env: &Env, schedule: &VestingSchedule) -> i128 {
-        let acc = Self::get_acc_reward_per_share_p2(env);
-        let earned = (schedule.supplied_p2 * acc) / REWARD_PRECISION;
-        earned.saturating_sub(schedule.reward_debt_p2)
-    }
+
 
     pub fn claim_p1_rewards(env: Env, vault_id: u64, caller: Address) {
         caller.require_auth();
@@ -1613,4 +1555,5 @@ impl TimeCapsule {
 }
 
 mod test;
+
 
