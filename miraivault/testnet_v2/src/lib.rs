@@ -12,8 +12,10 @@ use crate::mock_protocol::MockProtocolClient;
 #[cfg(test)]
 use crate::mock_defindex::MockDefindexClient;
 
-
+#[cfg(test)]
 mod mock_protocol;
+
+#[cfg(test)]
 mod mock_defindex;
 
 mod pool_client;
