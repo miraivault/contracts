@@ -1,4 +1,4 @@
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Vec, token, IntoVal};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Vec, token, IntoVal, Val};
 
 
 // ================== BLEND CLIENT ==================
@@ -34,7 +34,7 @@ impl<'a> PoolClient<'a> {
         spender: &Address,
         to: &Address,
         requests: &Vec<Request>,
-    ) {
+    ) -> Val {
         let args = soroban_sdk::vec![
             self.env,
             from.clone().into_val(self.env),
@@ -43,10 +43,11 @@ impl<'a> PoolClient<'a> {
             requests.clone().into_val(self.env),
         ];
 
-        self.env.invoke_contract::<()>(
+        let positions: Val = self.env.invoke_contract(
             &self.address,
             &soroban_sdk::symbol_short!("submit"),
             args,
         );
+        return positions;
     }
 }

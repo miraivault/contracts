@@ -1,6 +1,6 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contractevent, contracttype, token, Address, Env, Vec};
-
+use soroban_sdk::{contract, contractimpl, contractevent, contracttype, token, Address, Env, Vec, symbol_short, IntoVal, Symbol};
+use soroban_sdk::auth::{ContractContext, InvokerContractAuthEntry, SubContractInvocation};
 use crate::pool_client::{ PoolClient, Request, REQUEST_TYPE_SUPPLY_COLLATERAL, REQUEST_TYPE_WITHDRAW_COLLATERAL };
 
 use crate::defindex_client::{ DefindexClient };
@@ -8,6 +8,7 @@ use crate::defindex_client::{ DefindexClient };
 
 #[cfg(test)]
 use crate::mock_protocol::MockProtocolClient;
+
 
 #[cfg(test)]
 use crate::mock_defindex::MockDefindexClient;
@@ -68,7 +69,7 @@ pub struct VestingSchedule {
     pub token_address: Address,
     pub total_amount: i128,
     pub num_years: u32,
-    pub frequency: u32,           // 1, 2, or 4
+    pub frequency: u32,           // 1, 2, 4, or 52
     pub reward_split: u32,
     pub packet_amount: i128,
     pub start_timestamp: u64,
@@ -535,7 +536,10 @@ impl TimeCapsule {
         {
             let pool_addr = schedule.p1_pool.clone().unwrap();
             let asset = schedule.token_address.clone();
-            let vault = env.current_contract_address();
+            let vault_addr = env.current_contract_address();
+
+
+
 
             let mut requests = Vec::new(env);
             requests.push_back(Request {
@@ -544,8 +548,26 @@ impl TimeCapsule {
                 amount,
             });
 
+            let auth_entry = InvokerContractAuthEntry::Contract(SubContractInvocation {
+                context: ContractContext {
+                    contract: schedule.token_address.clone(),
+                    fn_name: Symbol::new(env, "transfer"),
+                    args: (
+                        vault_addr.clone(),
+                        pool_addr.clone(),
+                        amount
+                    ).into_val(env),
+                },
+                sub_invocations: Vec::new(env),
+            });
+
+
+            env.authorize_as_current_contract(Vec::from_array(env, [auth_entry]));
+
             let client = PoolClient::new(env, &pool_addr);
-            client.submit(&vault, &vault, &vault, &requests);
+            // We still call submit so Blend credits the position to the vault
+            let _positions = client.submit(&vault_addr, &vault_addr, &vault_addr, &requests);
+            return;
         }
     }
 
@@ -605,30 +627,33 @@ impl TimeCapsule {
         {
             let client = DefindexClient::new(env, &defindex_vault);
             let asset = schedule.token_address.clone();
+            //let token_client = token::Client::new(env, &asset);
 
-            // 1. Approve
-            let token_client = token::Client::new(env, &asset);
-            token_client.approve(
-                &vault_addr,
-                &defindex_vault,
-                &amount,
-                &(env.ledger().sequence() + 200),
-            );
 
-            // 2. Record shares before
-            let shares_before = client.balance(&vault_addr);
-
-            // 3. Deposit
             let mut amounts_desired = Vec::new(env);
             amounts_desired.push_back(amount);
+
             let mut amounts_min = Vec::new(env);
             amounts_min.push_back(0);
 
-            client.deposit(&amounts_desired, &amounts_min, &vault_addr, &true);
+            let auth_entry = InvokerContractAuthEntry::Contract(SubContractInvocation {
+                context: ContractContext {
+                    contract: schedule.token_address.clone(),
+                    fn_name: Symbol::new(env, "transfer"),
+                    args: (
+                        vault_addr.clone(),
+                        defindex_vault.clone(),
+                        amount
+                    ).into_val(env),
+                },
+                sub_invocations: Vec::new(env),
+            });
 
-            // 4. Shares received
-            let shares_after = client.balance(&vault_addr);
-            shares_after - shares_before
+            env.authorize_as_current_contract(Vec::from_array(env, [auth_entry]));
+
+            let shares_received = client.deposit(&amounts_desired, &amounts_min, &vault_addr, &true);
+
+            shares_received
         }
     }
 
@@ -725,7 +750,7 @@ impl TimeCapsule {
         }
 
         if num_years < 4 || num_years > 30 { panic!("num_years must be 4-30"); }
-        if frequency != 1 && frequency != 2 && frequency != 4 { panic!("frequency must be 1, 2 or 4"); }
+        if frequency != 1 && frequency != 2 && frequency != 4 && frequency != 52 { panic!("frequency must be 1, 2, 4 or 52"); }
         if total_amount < MIN_VAULT_AMT { panic!("total amount must be more than 100 XLM"); }
         if reward_split > 100 { panic!("reward_split 0-100"); }
 
@@ -1132,56 +1157,41 @@ impl TimeCapsule {
     pub fn supply_to_p1(env: Env, vault_id: u64, caller: Address, amount: i128) {
         caller.require_auth();
         let mut schedule: VestingSchedule = Self::get_vault(env.clone(), vault_id);
-        // Only sender can supply
+
         if schedule.sender != caller { panic!("Only sender can supply"); }
         if schedule.is_cancelled { panic!("Vault cancelled"); }
         if schedule.p1_pool.is_none() { panic!("P1 not configured"); }
-        if schedule.p1_ratio == 0 { panic!("P1 not authorized during vault creation") }
+        if schedule.p1_ratio == 0 { panic!("P1 not authorized during vault creation"); }
         if amount <= 0 { panic!("Invalid amount"); }
 
-        let idle = schedule.idle_amount; // implement based on total - supplied
-        if amount > idle { panic!("Insufficient idle balance"); }
+        if amount > schedule.idle_amount { panic!("Insufficient idle balance"); }
 
         let potential_amount_protocol = amount + schedule.supplied_p1;
-        if potential_amount_protocol > ((50 as i128) * schedule.total_amount) / (100 as i128) { panic!("Cannot allocate more than 50% to one protocol") };
-        if potential_amount_protocol > ((schedule.p1_ratio as i128) * schedule.total_amount) / (100 as i128) { panic!("Cannot allocate more than the initially chosen protocol ratio") };
+        if potential_amount_protocol > (50 * schedule.total_amount) / 100 {
+            panic!("Cannot allocate more than 50% to one protocol");
+        }
+        if potential_amount_protocol > (schedule.p1_ratio as i128 * schedule.total_amount) / 100 {
+            panic!("Cannot allocate more than the initially chosen protocol ratio");
+        }
         let potential_amount_total = amount + schedule.supplied_p1 + schedule.supplied_p2;
-        if potential_amount_total > ((70 as i128) * schedule.total_amount) / (100 as i128) { panic!("Cannot allocate more than 70% to all external protocols")};
-
-        let vault = env.current_contract_address();
-        Self::supply_to_p1_internal(&env, &schedule, &vault, amount);
-
-        let blnd = Self::get_p1_token_address(&env);
-        Self::update_p1_rewards(&env, &blnd);
-
-        let pending = Self::pending_p1_reward(&env, &schedule);
-
-        if pending > 0 {
-            let fee = (pending * PROTOCOL_FEE_BPS as i128) / 10_000;
-            let user_share = pending - fee;
-
-            let reward_client = token::Client::new(&env, &blnd);
-            let treasury = Self::get_treasury_address(&env);
-
-            reward_client.transfer(&env.current_contract_address(), &schedule.sender, &user_share);
-            if fee > 0 {
-                reward_client.transfer(&env.current_contract_address(), &treasury, &fee);
-            }
-
-            // Update last balance after transfer
-            let new_balance = reward_client.balance(&env.current_contract_address());
-            Self::set_last_reward_balance_p1(&env, new_balance);
+        if potential_amount_total > (70 * schedule.total_amount) / 100 {
+            panic!("Cannot allocate more than 70% to all external protocols");
         }
 
-        schedule.supplied_p1 += amount;
-        schedule.reward_debt_p1 = (schedule.supplied_p1 * Self::get_acc_reward_per_share_p1(&env)) / REWARD_PRECISION;
+        // Actual supply
+        Self::supply_to_p1_internal(&env, &schedule, &env.current_contract_address(), amount);
 
+        // Update accounting only
+        schedule.supplied_p1 += amount;
+        schedule.idle_amount -= amount;
+
+        // Update global total
         let mut total = Self::get_total_supplied_p1(&env);
         total += amount;
         Self::set_total_supplied_p1(&env, total);
 
-
-        schedule.idle_amount -= amount;
+        // Update reward debt so future rewards are calculated correctly
+        schedule.reward_debt_p1 = (schedule.supplied_p1 * Self::get_acc_reward_per_share_p1(&env)) / REWARD_PRECISION;
 
         env.storage().persistent().set(&DataKey::Vault(vault_id), &schedule);
     }
@@ -1209,6 +1219,10 @@ impl TimeCapsule {
         // Actual deposit (returns shares received)
         let shares_received = Self::supply_to_p2_internal(&env, &schedule, &env.current_contract_address(), amount);
 
+        if shares_received <= 0 {
+            panic!("Cannot have Negative Shares");
+        }
+
         // Update accounting
         schedule.supplied_p2 += amount;
         schedule.p2_shares += shares_received;
@@ -1227,6 +1241,7 @@ impl TimeCapsule {
     pub fn withdraw_from_p1(env: Env, vault_id: u64, caller: Address, amount: i128) {
         caller.require_auth();
         let mut schedule: VestingSchedule = Self::get_vault(env.clone(), vault_id);
+
         if schedule.sender != caller && schedule.beneficiary != caller {
             panic!("Only sender or beneficiary can withdraw from protocol");
         }
@@ -1235,13 +1250,14 @@ impl TimeCapsule {
         if schedule.p1_ratio == 0 { panic!("P1 not authorized during vault creation"); }
         if amount > schedule.supplied_p1 { panic!("Insufficient supplied balance to protocol"); }
 
+        // 1. Pull from Blend
         Self::withdraw_from_p1_internal(&env, &schedule, amount, &env.current_contract_address());
 
+        // 2. Harvest any pending BLND rewards (safe version)
         let blnd = Self::get_p1_token_address(&env);
         Self::update_p1_rewards(&env, &blnd);
 
         let pending = Self::pending_p1_reward(&env, &schedule);
-
         if pending > 0 {
             let fee = (pending * PROTOCOL_FEE_BPS as i128) / 10_000;
             let user_share = pending - fee;
@@ -1249,27 +1265,33 @@ impl TimeCapsule {
             let reward_client = token::Client::new(&env, &blnd);
             let treasury = Self::get_treasury_address(&env);
 
-            reward_client.transfer(&env.current_contract_address(), &schedule.sender, &user_share);
-            if fee > 0 {
-                reward_client.transfer(&env.current_contract_address(), &treasury, &fee);
+            // Only transfer if the contract actually has the tokens
+            let contract_bal = reward_client.balance(&env.current_contract_address());
+            if contract_bal >= pending {
+                if user_share > 0 {
+                    reward_client.transfer(&env.current_contract_address(), &schedule.sender, &user_share);
+                }
+                if fee > 0 {
+                    reward_client.transfer(&env.current_contract_address(), &treasury, &fee);
+                }
+                // Update last balance after successful transfer
+                let new_balance = reward_client.balance(&env.current_contract_address());
+                Self::set_last_reward_balance_p1(&env, new_balance);
             }
-
-            // Update last balance after transfer
-            let new_balance = reward_client.balance(&env.current_contract_address());
-            Self::set_last_reward_balance_p1(&env, new_balance);
         }
 
+        // 3. Update accounting
         schedule.supplied_p1 -= amount;
+        schedule.idle_amount += amount;
         schedule.reward_debt_p1 = (schedule.supplied_p1 * Self::get_acc_reward_per_share_p1(&env)) / REWARD_PRECISION;
 
         let mut total = Self::get_total_supplied_p1(&env);
         total -= amount;
         Self::set_total_supplied_p1(&env, total);
 
-        schedule.idle_amount += amount;
-
         env.storage().persistent().set(&DataKey::Vault(vault_id), &schedule);
     }
+
 
     pub fn withdraw_from_p2(env: Env, vault_id: u64, caller: Address, amount: i128) {
         caller.require_auth();
@@ -1343,14 +1365,13 @@ impl TimeCapsule {
         if schedule.p1_ratio == 0 { panic!("P1 not authorized during vault creation"); }
         if amount > schedule.supplied_p1 { panic!("Insufficient supplied balance to protocol"); }
 
-
         Self::withdraw_from_p1_internal(&env, &schedule, amount, &env.current_contract_address());
 
+        // Same safe reward harvesting
         let blnd = Self::get_p1_token_address(&env);
         Self::update_p1_rewards(&env, &blnd);
 
         let pending = Self::pending_p1_reward(&env, &schedule);
-
         if pending > 0 {
             let fee = (pending * PROTOCOL_FEE_BPS as i128) / 10_000;
             let user_share = pending - fee;
@@ -1358,24 +1379,26 @@ impl TimeCapsule {
             let reward_client = token::Client::new(&env, &blnd);
             let treasury = Self::get_treasury_address(&env);
 
-            reward_client.transfer(&env.current_contract_address(), &schedule.sender, &user_share);
-            if fee > 0 {
-                reward_client.transfer(&env.current_contract_address(), &treasury, &fee);
+            let contract_bal = reward_client.balance(&env.current_contract_address());
+            if contract_bal >= pending {
+                if user_share > 0 {
+                    reward_client.transfer(&env.current_contract_address(), &schedule.sender, &user_share);
+                }
+                if fee > 0 {
+                    reward_client.transfer(&env.current_contract_address(), &treasury, &fee);
+                }
+                let new_balance = reward_client.balance(&env.current_contract_address());
+                Self::set_last_reward_balance_p1(&env, new_balance);
             }
-
-            // Update last balance after transfer
-            let new_balance = reward_client.balance(&env.current_contract_address());
-            Self::set_last_reward_balance_p1(&env, new_balance);
         }
 
         schedule.supplied_p1 -= amount;
+        schedule.idle_amount += amount;
         schedule.reward_debt_p1 = (schedule.supplied_p1 * Self::get_acc_reward_per_share_p1(&env)) / REWARD_PRECISION;
 
         let mut total = Self::get_total_supplied_p1(&env);
         total -= amount;
         Self::set_total_supplied_p1(&env, total);
-
-        schedule.idle_amount += amount;
 
         env.storage().persistent().set(&DataKey::Vault(vault_id), &schedule);
     }
@@ -1557,5 +1580,4 @@ impl TimeCapsule {
 }
 
 mod test;
-
 

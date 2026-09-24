@@ -971,7 +971,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "frequency must be 1, 2 or 4")]
+    #[should_panic(expected = "frequency must be 1, 2, 4 or 52")]
     fn test_improper_frequency() {
         let env = Env::default();
 
@@ -1989,4 +1989,3 @@ mod test {
 
 
 }
-

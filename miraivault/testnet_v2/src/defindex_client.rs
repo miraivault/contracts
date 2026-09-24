@@ -19,8 +19,8 @@ impl DefindexClient {
         amounts_min: &Vec<i128>,
         from: &Address,
         invest: &bool,
-    ) {
-        self.env.invoke_contract::<()>(
+    ) -> i128 {
+        let result: (Vec<i128>, i128, Vec<()>) = self.env.invoke_contract(
             &self.address,
             &Symbol::new(&self.env, "deposit"),
             (
@@ -31,6 +31,7 @@ impl DefindexClient {
             )
                 .into_val(&self.env),
         );
+        result.1
     }
 
     pub fn withdraw(
