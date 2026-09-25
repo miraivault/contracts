@@ -69,7 +69,7 @@ pub struct VestingSchedule {
     pub token_address: Address,
     pub total_amount: i128,
     pub num_years: u32,
-    pub frequency: u32,           // 1, 2, 4, or 52
+    pub frequency: u32,           // 1, 2, 4, or 365
     pub reward_split: u32,
     pub packet_amount: i128,
     pub start_timestamp: u64,
@@ -599,7 +599,8 @@ impl TimeCapsule {
 
             let client = PoolClient::new(env, &pool_addr);
             // Tokens will be sent to `to` (normally the vault itself)
-            client.submit(&vault, &vault, to, &requests);
+            let _positions = client.submit(&vault, &vault, to, &requests);
+            return;
         }
     }
 
@@ -706,16 +707,12 @@ impl TimeCapsule {
                 return (0, 0);
             }
 
-            // Measure balance before
-            let bal_before = token_client.balance(&vault_addr);
-
             let mut min_amounts_out = Vec::new(env);
             min_amounts_out.push_back(0);
 
-            client.withdraw(shares_to_burn, &min_amounts_out, to);
+            let amounts_out = client.withdraw(shares_to_burn, &min_amounts_out, to);
 
-            let bal_after = token_client.balance(&vault_addr);
-            let underlying_received = bal_after - bal_before;
+            let underlying_received = amounts_out.get(0).unwrap_or(0);
 
             (underlying_received, shares_to_burn)
         }
@@ -750,7 +747,7 @@ impl TimeCapsule {
         }
 
         if num_years < 4 || num_years > 30 { panic!("num_years must be 4-30"); }
-        if frequency != 1 && frequency != 2 && frequency != 4 && frequency != 52 { panic!("frequency must be 1, 2, 4 or 52"); }
+        if frequency != 1 && frequency != 2 && frequency != 4 && frequency != 365 { panic!("frequency must be 1, 2, 4 or 365"); }
         if total_amount < MIN_VAULT_AMT { panic!("total amount must be more than 100 XLM"); }
         if reward_split > 100 { panic!("reward_split 0-100"); }
 
@@ -1580,4 +1577,5 @@ impl TimeCapsule {
 }
 
 mod test;
+
 

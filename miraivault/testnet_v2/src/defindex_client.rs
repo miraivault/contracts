@@ -39,8 +39,8 @@ impl DefindexClient {
         withdraw_shares: i128,
         min_amounts_out: &Vec<i128>,
         from: &Address,
-    ) {
-        self.env.invoke_contract::<()>(
+    ) -> Vec<i128> {
+        let result: Vec<i128> = self.env.invoke_contract(
             &self.address,
             &Symbol::new(&self.env, "withdraw"),
             (
@@ -50,6 +50,7 @@ impl DefindexClient {
             )
                 .into_val(&self.env),
         );
+        return result;
     }
 
     pub fn total_supply(&self) -> i128 {
@@ -77,3 +78,4 @@ impl DefindexClient {
         )
     }
 }
+
