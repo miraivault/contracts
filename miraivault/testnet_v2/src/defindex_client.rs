@@ -1,4 +1,4 @@
-use soroban_sdk::{Address, Env, Vec, IntoVal, Symbol};
+use soroban_sdk::{Address, Env, Vec, IntoVal, Symbol, Val, TryFromVal};
 
 pub struct DefindexClient {
     env: Env,
@@ -61,12 +61,25 @@ impl DefindexClient {
         )
     }
 
-    pub fn fetch_total_managed_funds(&self) -> Vec<i128> {
-        self.env.invoke_contract(
+    pub fn fetch_total_managed_funds(&self) -> i128 {
+        let result: Vec<soroban_sdk::Map<soroban_sdk::Symbol, Val>> = self.env.invoke_contract(
             &self.address,
             &Symbol::new(&self.env, "fetch_total_managed_funds"),
             ().into_val(&self.env),
-        )
+        );
+
+
+        if let Some(first) = result.get(0) {
+
+            if let Some(val) = first.get(Symbol::new(&self.env, "total_amount")) {
+                match i128::try_from_val(&self.env, &val) {
+                    Ok(amount) => return amount,
+                    Err(_) => return 0
+                }
+            }
+        }
+
+        0
     }
 
     /// NEW: balance of dfTokens (shares) owned by an address

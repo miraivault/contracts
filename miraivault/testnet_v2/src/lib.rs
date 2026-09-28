@@ -695,7 +695,7 @@ impl TimeCapsule {
 
             let total_shares = client.total_supply();
             let managed_funds = client.fetch_total_managed_funds();
-            let total_underlying = managed_funds.get(0).unwrap_or(0);
+            let total_underlying = managed_funds;
 
             if total_shares == 0 || total_underlying == 0 {
                 return (0, 0);
