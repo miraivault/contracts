@@ -28,7 +28,8 @@ const MAX_LARGENESS: i128 = 100_000_000_000;
 const MAX_TRUE_BALANCE_RATIO: i128 = 66;   // 66% of total MIRAI supply
 const PROTOCOL_FEE_BPS: u32 = 500;          // 5% protocol fee on yield rewards
 const REWARD_PRECISION: i128 = 1_000_000_000_000; // 1e12
-
+const WITHDRAW_COOLDOWN: u64 = 14 * 24 * 60 * 60; // 14 days in seconds
+const BLEND_ASSUMED_LOSS_BPS: i128 = 50;
 
 
 #[contract]
@@ -95,6 +96,12 @@ pub struct VestingSchedule {
     // already credited rewards from secondary protocols
     pub reward_debt_p1: i128,
     pub reward_debt_p2: i128,
+
+    pub p1_cooldown: u64,
+    pub p2_cooldown: u64,
+
+    pub p1_losses: i128,
+    pub p2_losses: i128
 }
 
 #[contracttype]
@@ -430,7 +437,7 @@ impl TimeCapsule {
         let vested = Self::get_vested_packets(&env, &schedule);
         vested >= schedule.num_years * schedule.frequency
     }
-    
+
     pub fn get_idle_amount(env: Env, vault_id: u64) -> i128 {
         let schedule: VestingSchedule = Self::get_vault(env.clone(), vault_id);
         schedule.idle_amount
@@ -809,6 +816,10 @@ impl TimeCapsule {
             last_withdraw_from: lwf,
             reward_debt_p1: 0,
             reward_debt_p2: 0,
+            p1_cooldown: 0,
+            p2_cooldown: 0,
+            p1_losses: 0,
+            p2_losses: 0,
         };
 
         let total_reward = Self::calculate_reward(&env, total_amount, num_years);
@@ -926,6 +937,7 @@ impl TimeCapsule {
             let total_should_be_released = schedule.total_amount; // exact original amount
 
             amount_due = total_should_be_released - total_released_so_far;
+
         }
 
         if amount_due <= 0 {
@@ -985,6 +997,12 @@ impl TimeCapsule {
             }
 
             schedule = Self::get_vault(env.clone(), vault_id);
+        }
+
+        if is_final_claim {
+            schedule = Self::get_vault(env.clone(), vault_id);
+            let total_loss = schedule.p1_losses.saturating_add(schedule.p2_losses);
+            amount_due = amount_due.saturating_sub(total_loss);
         }
 
         // Now we can trust schedule.idle_amount
@@ -1114,7 +1132,8 @@ impl TimeCapsule {
         schedule = Self::get_vault(env.clone(), vault_id);
 
         // 3. Everything that is now idle belongs to the sender
-        let amount_to_return = schedule.idle_amount;
+        let total_loss = schedule.p1_losses.saturating_add(schedule.p2_losses);
+        let amount_to_return = schedule.idle_amount.saturating_sub(total_loss);
 
         if amount_to_return > 0 {
             let token_client = token::Client::new(&env, &schedule.token_address);
@@ -1247,8 +1266,16 @@ impl TimeCapsule {
         if schedule.p1_ratio == 0 { panic!("P1 not authorized during vault creation"); }
         if amount > schedule.supplied_p1 { panic!("Insufficient supplied balance to protocol"); }
 
+        if env.ledger().timestamp() < schedule.p1_cooldown {
+            panic!("P1 withdraw is still in cooldown");
+        }
+
         // 1. Pull from Blend
         Self::withdraw_from_p1_internal(&env, &schedule, amount, &env.current_contract_address());
+
+        let loss = (amount * BLEND_ASSUMED_LOSS_BPS) / 10_000;
+        let actual_received = amount - loss;
+        schedule.p1_losses = schedule.p1_losses.saturating_add(loss);
 
         // 2. Harvest any pending BLND rewards (safe version)
         let blnd = Self::get_p1_token_address(&env);
@@ -1279,7 +1306,9 @@ impl TimeCapsule {
 
         // 3. Update accounting
         schedule.supplied_p1 -= amount;
-        schedule.idle_amount += amount;
+        schedule.idle_amount += actual_received;
+        schedule.p1_cooldown = env.ledger().timestamp() + WITHDRAW_COOLDOWN;
+
         schedule.reward_debt_p1 = (schedule.supplied_p1 * Self::get_acc_reward_per_share_p1(&env)) / REWARD_PRECISION;
 
         let mut total = Self::get_total_supplied_p1(&env);
@@ -1300,6 +1329,10 @@ impl TimeCapsule {
         if schedule.p2_pool.is_none() || amount <= 0 { panic!("Invalid request"); }
         if schedule.p2_ratio == 0 { panic!("P2 not authorized during vault creation"); }
         if amount > schedule.supplied_p2 { panic!("Insufficient supplied balance to protocol"); }
+
+        if env.ledger().timestamp() < schedule.p2_cooldown {
+            panic!("P2 withdraw is still in cooldown");
+        }
 
         let (underlying_received, shares_burned) =
         Self::withdraw_from_p2_internal(&env, &schedule, amount, &env.current_contract_address());
@@ -1333,11 +1366,19 @@ impl TimeCapsule {
             }
         }
 
+
+        let loss = principal_portion.saturating_sub(underlying_received.min(principal_portion));
+        schedule.p2_losses = schedule.p2_losses.saturating_add(loss);
+
+
+
+
         // Update accounting
         schedule.p2_shares = schedule.p2_shares.saturating_sub(shares_burned);
         schedule.p2_principal = schedule.p2_principal.saturating_sub(principal_portion);
         schedule.supplied_p2 = schedule.supplied_p2.saturating_sub(principal_portion);
-        schedule.idle_amount += principal_portion;
+        schedule.idle_amount += principal_portion.min(underlying_received);
+        schedule.p2_cooldown = env.ledger().timestamp() + WITHDRAW_COOLDOWN;
 
         // Global total
         let mut total = Self::get_total_supplied_p2(&env);
@@ -1363,6 +1404,11 @@ impl TimeCapsule {
         if amount > schedule.supplied_p1 { panic!("Insufficient supplied balance to protocol"); }
 
         Self::withdraw_from_p1_internal(&env, &schedule, amount, &env.current_contract_address());
+
+        let loss = (amount * BLEND_ASSUMED_LOSS_BPS) / 10_000;
+        let actual_received = amount - loss;
+
+        schedule.p1_losses = schedule.p1_losses.saturating_add(loss);
 
         // Same safe reward harvesting
         let blnd = Self::get_p1_token_address(&env);
@@ -1390,7 +1436,8 @@ impl TimeCapsule {
         }
 
         schedule.supplied_p1 -= amount;
-        schedule.idle_amount += amount;
+        schedule.idle_amount += actual_received;
+
         schedule.reward_debt_p1 = (schedule.supplied_p1 * Self::get_acc_reward_per_share_p1(&env)) / REWARD_PRECISION;
 
         let mut total = Self::get_total_supplied_p1(&env);
@@ -1448,11 +1495,16 @@ impl TimeCapsule {
             }
         }
 
+
+        let loss = principal_portion.saturating_sub(underlying_received.min(principal_portion));
+        schedule.p2_losses = schedule.p2_losses.saturating_add(loss);
+
+
         // Update accounting
         schedule.p2_shares = schedule.p2_shares.saturating_sub(shares_burned);
         schedule.p2_principal = schedule.p2_principal.saturating_sub(principal_portion);
         schedule.supplied_p2 = schedule.supplied_p2.saturating_sub(principal_portion);
-        schedule.idle_amount += principal_portion;
+        schedule.idle_amount += principal_portion.min(underlying_received);
 
         // Global total
         let mut total = Self::get_total_supplied_p2(&env);
@@ -1577,4 +1629,5 @@ impl TimeCapsule {
 }
 
 mod test;
+
 
