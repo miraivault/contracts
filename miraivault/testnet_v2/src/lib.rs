@@ -1018,6 +1018,15 @@ impl TimeCapsule {
 
         env.storage().persistent().set(&DataKey::Vault(vault_id), &schedule);
 
+        if is_final_claim {
+            Self::harvest_p1_rewards_internal(&env, vault_id);
+            Self::settle_remaining_mirai_rewards(&env, vault_id);
+            schedule = Self::get_vault(env.clone(), vault_id);
+            env.storage().persistent().set(&DataKey::Vault(vault_id), &schedule);
+        }
+
+
+
         MainClaimedEvent {
             vault_id,
             beneficiary,
@@ -1130,6 +1139,10 @@ impl TimeCapsule {
 
         // 2. Re-fetch after the safe withdraws (critical)
         schedule = Self::get_vault(env.clone(), vault_id);
+
+        Self::harvest_p1_rewards_internal(&env, vault_id);
+        Self::settle_remaining_mirai_rewards(&env, vault_id);
+        schedule = Self::get_vault(env.clone(), vault_id); //re-fetch
 
         // 3. Everything that is now idle belongs to the sender
         let total_loss = schedule.p1_losses.saturating_add(schedule.p2_losses);
@@ -1605,6 +1618,76 @@ impl TimeCapsule {
             user_share,
             fee,
         }.publish(&env);
+    }
+
+    // ================== WIND-DOWN FUNCTIONS ============================
+
+    fn harvest_p1_rewards_internal(env: &Env, vault_id: u64) {
+        let mut schedule = Self::get_vault(env.clone(), vault_id);
+        if schedule.supplied_p1 == 0 && schedule.reward_debt_p1 == 0 {
+            return; // nothing to do
+        }
+
+        let blnd = Self::get_p1_token_address(env);
+        Self::update_p1_rewards(env, &blnd);
+
+        let pending = Self::pending_p1_reward(env, &schedule);
+        if pending <= 0 {
+            return;
+        }
+
+        let fee = (pending * PROTOCOL_FEE_BPS as i128) / 10_000;
+        let user_share = pending - fee;
+
+        let reward_client = token::Client::new(env, &blnd);
+        let treasury = Self::get_treasury_address(env);
+        let contract_bal = reward_client.balance(&env.current_contract_address());
+
+        if contract_bal >= pending {
+            if user_share > 0 {
+                reward_client.transfer(&env.current_contract_address(), &schedule.sender, &user_share);
+            }
+            if fee > 0 {
+                reward_client.transfer(&env.current_contract_address(), &treasury, &fee);
+            }
+            Self::set_last_reward_balance_p1(env, reward_client.balance(&env.current_contract_address()));
+        }
+
+        schedule.reward_debt_p1 = (schedule.supplied_p1 * Self::get_acc_reward_per_share_p1(env)) / REWARD_PRECISION;
+        env.storage().persistent().set(&DataKey::Vault(vault_id), &schedule);
+    }
+
+
+    fn settle_remaining_mirai_rewards(env: &Env, vault_id: u64) {
+        let mut reward_info = Self::get_reward(env.clone(), vault_id);
+        let schedule = Self::get_vault(env.clone(), vault_id);
+
+        let mirai_client = token::Client::new(env, &Self::get_mirai_address(env));
+        let contract = env.current_contract_address();
+
+        // Sender remainder
+        let sender_due = reward_info.sender_share - reward_info.claimed_sender;
+        if sender_due > 0 {
+            let bal = mirai_client.balance(&contract);
+            let pay = sender_due.min(bal);
+            if pay > 0 {
+                mirai_client.transfer(&contract, &schedule.sender, &pay);
+                reward_info.claimed_sender += pay;
+            }
+        }
+
+        // Beneficiary remainder
+        let receiver_due = reward_info.receiver_share - reward_info.claimed_receiver;
+        if receiver_due > 0 {
+            let bal = mirai_client.balance(&contract);
+            let pay = receiver_due.min(bal);
+            if pay > 0 {
+                mirai_client.transfer(&contract, &schedule.beneficiary, &pay);
+                reward_info.claimed_receiver += pay;
+            }
+        }
+
+        env.storage().persistent().set(&DataKey::Reward(vault_id), &reward_info);
     }
 
 

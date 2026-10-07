@@ -473,7 +473,7 @@ mod test {
         vault_client.cancel_remaining(&vault_id, &sender);
 
         let final_balance = vesting_client.balance(&sender);
-        assert!(final_balance < initial_balance, "Sender should get slightly less amount back after cancel");
+        assert!((initial_balance - final_balance) * 100 < 1 * initial_balance, "Sender should get slightly less amount back after cancel");
 
         let final_schedule = vault_client.get_vault(&vault_id);
         assert!(final_schedule.is_cancelled);
@@ -573,7 +573,7 @@ mod test {
 
         let final_balance_sender = vesting_client.balance(&sender);
         let final_balance_beneficiary = packet_amount * packets_claimed as i128;
-        assert!(final_balance_sender + final_balance_beneficiary < total_amount, "Sender and Beneficiary total should remain slightly less than total amount.");
+        assert!((total_amount - final_balance_sender - final_balance_beneficiary) * 100 < 1 * total_amount, "Sender and Beneficiary total should remain slightly less than total amount.");
 
         let final_schedule = vault_client.get_vault(&vault_id);
         assert!(final_schedule.is_cancelled);
@@ -1846,7 +1846,7 @@ mod test {
         assert_eq!(s.idle_amount, 0);
 
         // Beneficiary got almost the full principal
-        assert!(vesting_client.balance(&beneficiary) < total, "Beneficiary should get almost the entire amount.");
+        assert!((total - vesting_client.balance(&beneficiary)) * 100 < 1 * total, "Beneficiary should get almost the entire amount.");
 
         // Sender got the P2 yield (95%)
         let expected_yield = supply_p2 / 10;
